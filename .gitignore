@@ -6,3 +6,4 @@ __pycache__/
 cookies.txt
 logs/
 lol-indexer/events.json
+deploy/job.env.yaml

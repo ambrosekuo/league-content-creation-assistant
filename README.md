@@ -14,6 +14,16 @@ Timestamped metadata
 Transcription and highlight scoring (next stage)
 ```
 
+## Cloud archive (GCS + Cloud Run Job)
+
+Scaffolding lives in `cloud_job.py`, `storage_gcs.py`, `Dockerfile`, and `deploy/README.md`.
+
+- Local downloads under `data/` are **not** used by the cloud job (`WORK_DIR=/tmp/vod-work`).
+- `.dockerignore` excludes `data/` so image builds never package in-progress VODs.
+- `upload-dataset` refuses folders that still contain `*.part` files.
+
+See [deploy/README.md](deploy/README.md).
+
 ## Do I need to download the whole VOD?
 
 For the first version, **yes**. Downloading the complete VOD gives you a stable local timeline and lets later stages repeatedly:

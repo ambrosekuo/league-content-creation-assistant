@@ -1,0 +1,14 @@
+# Never send local VOD downloads into the image build context
+data/
+.venv/
+logs/
+.env
+.git/
+**/__pycache__/
+*.pyc
+*.part
+*.ytdl
+**/*.mp4
+**/*.mkv
+**/*.wav
+cookies.txt
