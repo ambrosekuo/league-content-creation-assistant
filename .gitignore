@@ -1,0 +1,8 @@
+data/
+.venv/
+__pycache__/
+*.pyc
+.env
+cookies.txt
+logs/
+lol-indexer/events.json
