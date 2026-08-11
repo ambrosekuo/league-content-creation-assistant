@@ -17,14 +17,29 @@ Archives Twitch VODs + LoL event indexes to GCS.
 ## Layout in GCS
 
 ```text
-gs://$GCS_BUCKET/$GCS_PREFIX/{vodId}/
+gs://$GCS_BUCKET/vods/{dayKey}/{vodId}/   # e.g. vods/aug09_2026/2841932660/
   source.mp4
   metadata.json
   lol_events.json
-  ingest.json          # if present
-  clips/…              # optional later
-  _upload_manifest.json
+  transcript.json              # event-window ASR (when TRANSCRIPT_SNAP=1)
+  lol_events_snapped.json
+  lol_clips/…
+  archive_manifest.json
+
+gs://$GCS_BUCKET/work/{dayKey}/{vodId}/   # resume copies
 ```
+
+`dayKey` comes from the VOD `timestamp` in America/New_York as `aug10_2026` (override with `GCS_DAY_KEY`). Legacy flat `vods/{vodId}/` is still readable for resume.
+### Resume behavior (Cloud Run)
+
+Cloud Run **local `/tmp` dies with the container**. Durable resume uses GCS:
+
+1. Download from Twitch → local `/tmp/vod-work/{id}`
+2. **Immediately upload** `source.mp4` (+ sidecars) to `vods/` and `work/`
+3. Index + cut clips + write `archive_manifest.json`
+4. On retry: if `source.mp4` exists in GCS, **skip Twitch** and restore into `/tmp`, then continue
+
+Do **not** write yt-dlp HLS fragments through GCS FUSE (unreliable). FUSE is optional for reads; downloads use local disk, then `google-cloud-storage` upload.
 
 ## One-time GCP setup
 
@@ -81,17 +96,24 @@ gcloud builds submit --tag "$IMAGE" .
 gcloud run jobs create vod-archive-nightly \
   --image="$IMAGE" \
   --region="$REGION" \
-  --task-timeout=4h \
-  --memory=4Gi \
-  --cpu=2 \
-  --max-retries=1 \
-  --set-env-vars="GCS_BUCKET=${GCS_BUCKET},GCS_PREFIX=vods,TWITCH_CHANNEL=lolambrosek,RIOT_ID=lolAmbrosek#twtv,RIOT_REGION=americas,WORK_DIR=/tmp/vod-work" \
+  --execution-environment=gen2 \
+  --task-timeout=24h \
+  --memory=16Gi \
+  --cpu=4 \
+  --max-retries=2 \
+  --set-env-vars="GCS_BUCKET=${GCS_BUCKET},GCS_PREFIX=vods,TWITCH_CHANNEL=lolambrosek,RIOT_ID=twtv lolAmbrosek#twtv,RIOT_REGION=americas,WORK_DIR=/tmp/vod-work" \
   --set-secrets="RIOT_API_KEY=RIOT_API_KEY:latest,TWITCH_CLIENT_ID=TWITCH_CLIENT_ID:latest,TWITCH_CLIENT_SECRET=TWITCH_CLIENT_SECRET:latest" \
   --command=python \
   --args="cloud_job.py,nightly,--limit,3,--cleanup"
 ```
 
-> Large VODs (~12GB): raise memory / consider `--cpu-boost` or a Batch/GCE worker if `/tmp` space is insufficient. Cloud Run ephemeral disk can be increased in newer runtimes (`--gpu` not needed; look for `EmptyDir` / ephemeral storage flags for your gcloud version).
+> Long VODs (~12h): keep `--task-timeout=24h`, gen2 + ≥24Gi for ~18GiB 720p. `YTDLP_FORMAT` defaults to 720p in `cloud_job.py`. Cloud ingest uses `--skip-audio`.
+>
+> **Transcript snap (default ON):** after Riot index, cloud runs `transcribe_event_windows.py` (whisper only around KILL/DEATH, not the full VOD) → `snap_clips_to_transcript.py` → cut from snapped windows. Set `TRANSCRIPT_SNAP=0` to skip. Outputs `transcript.json` + `lol_events_snapped.json` to GCS with the archive.
+>
+> **Default archive path:** full 720p HLS download → GCS checkpoint → Riot index → event-window ASR → **center-on-event snap** (~8s pre / 6s post, max 18s, soft speech nudge) → cut. Prefer this over segmented downloads (section re-encode is far slower than HLS).
+>
+> **Recut existing archives** (no Twitch re-download): `python cloud_job.py recut-clips --vod-id <id> --cleanup` reuses `source.mp4` + `transcript.json` from GCS, replaces `lol_clips/`.
 
 ### Manual test (dry-run, no download)
 

@@ -67,6 +67,7 @@ class PlayerEvent:
     vodTime: str | None = None
     clipStart: str | None = None
     clipEnd: str | None = None
+    opponentChampion: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         data = {
@@ -86,6 +87,8 @@ class PlayerEvent:
             data["clipStart"] = self.clipStart
         if self.clipEnd is not None:
             data["clipEnd"] = self.clipEnd
+        if self.opponentChampion is not None:
+            data["opponentChampion"] = self.opponentChampion
         return data
 
 
@@ -103,6 +106,7 @@ class MatchSummary:
     gameCreation: int | None = None
     gameEndTimestamp: int | None = None
     participantId: int | None = None
+    teamPosition: str | None = None
     events: list[PlayerEvent] = field(default_factory=list)
     error: str | None = None
 
@@ -126,6 +130,8 @@ class MatchSummary:
             data["gameEndTimestamp"] = self.gameEndTimestamp
         if self.participantId is not None:
             data["participantId"] = self.participantId
+        if self.teamPosition is not None:
+            data["teamPosition"] = self.teamPosition
         if self.error is not None:
             data["error"] = self.error
         return data
@@ -170,10 +176,22 @@ def extract_player_events(
     timeline: dict[str, Any],
     participant_id: int,
     team_id: int | None = None,
+    *,
+    champion_by_id: dict[int, str] | None = None,
 ) -> list[PlayerEvent]:
     """Walk timeline frames and collect KILL/DEATH/ASSIST (+ optional objectives)."""
     events: list[PlayerEvent] = []
     frames = (timeline.get("info") or {}).get("frames") or []
+    champs = champion_by_id or {}
+
+    def opponent_name(other_id: Any) -> str | None:
+        if other_id is None:
+            return None
+        try:
+            name = champs.get(int(other_id))
+        except (TypeError, ValueError):
+            return None
+        return str(name) if name else None
 
     for frame in frames:
         for event in frame.get("events") or []:
@@ -193,6 +211,7 @@ def extract_player_events(
                             type="KILL",
                             gameTimeMs=int(timestamp),
                             gameTime=format_mmss(int(timestamp)),
+                            opponentChampion=opponent_name(victim_id),
                         )
                     )
                 elif victim_id == participant_id:
@@ -201,6 +220,7 @@ def extract_player_events(
                             type="DEATH",
                             gameTimeMs=int(timestamp),
                             gameTime=format_mmss(int(timestamp)),
+                            opponentChampion=opponent_name(killer_id),
                         )
                     )
                 elif participant_id in assisting:
@@ -210,6 +230,7 @@ def extract_player_events(
                             type="ASSIST",
                             gameTimeMs=int(timestamp),
                             gameTime=format_mmss(int(timestamp)),
+                            opponentChampion=opponent_name(victim_id),
                         )
                     )
 

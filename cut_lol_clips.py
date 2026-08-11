@@ -49,6 +49,50 @@ def format_timestamp(seconds: float) -> str:
     return f"{hours:02d}h{minutes:02d}m{secs:02d}s"
 
 
+def safe_token(value: str | None, *, fallback: str = "Unknown") -> str:
+    text = "".join(ch for ch in str(value or "") if ch.isalnum())
+    return text or fallback
+
+
+def assign_game_clip_indices(windows: list[dict[str, Any]]) -> None:
+    """Number games in VOD order; number clips within each game."""
+    first_seen: dict[str, float] = {}
+    for window in windows:
+        match_id = str(window.get("matchId") or "unknown")
+        start = float(window.get("start") or 0.0)
+        if match_id not in first_seen or start < first_seen[match_id]:
+            first_seen[match_id] = start
+    order = sorted(first_seen.keys(), key=lambda mid: first_seen[mid])
+    game_index = {mid: i + 1 for i, mid in enumerate(order)}
+    counters: dict[str, int] = {}
+    for window in windows:
+        match_id = str(window.get("matchId") or "unknown")
+        counters[match_id] = counters.get(match_id, 0) + 1
+        window["gameIndex"] = game_index[match_id]
+        window["clipIndexInGame"] = counters[match_id]
+
+
+def clip_relpath(window: dict[str, Any]) -> Path:
+    """
+    Per-game folder + clip number for easy browse/stitch:
+
+      g01_Leblanc/c03_kill.mp4
+      g01_Leblanc/c03_kill_vsAhri.mp4   (when opponent known)
+    """
+    champ = safe_token(window.get("champion"))
+    game_n = int(window.get("gameIndex") or 1)
+    clip_n = int(window.get("clipIndexInGame") or 1)
+    label = "+".join(
+        dict.fromkeys(t.lower() for t in (window.get("types") or [window.get("type") or "event"]))
+    )
+    folder = f"g{game_n:02d}_{champ}"
+    stem = f"c{clip_n:02d}_{label}"
+    opponent = window.get("opponentChampion")
+    if opponent:
+        stem = f"{stem}_vs{safe_token(opponent)}"
+    return Path(folder) / f"{stem}.mp4"
+
+
 def find_source(dataset_dir: Path, explicit: Path | None) -> Path:
     if explicit is not None:
         path = explicit.resolve()
@@ -108,6 +152,10 @@ def collect_events(
                     "type": event_type,
                     "matchId": match.get("matchId"),
                     "champion": match.get("champion"),
+                    "win": match.get("win"),
+                    "queueId": match.get("queueId"),
+                    "teamPosition": match.get("teamPosition"),
+                    "opponentChampion": event.get("opponentChampion"),
                     "gameTime": event.get("gameTime"),
                     "vodTime": event.get("vodTime"),
                     "vodOffsetSeconds": event.get("vodOffsetSeconds"),
@@ -196,6 +244,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path to lol_events.json (default: <dataset-dir>/lol_events.json)",
     )
     parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=None,
+        help="Clip output folder (default: <dataset-dir>/lol_clips)",
+    )
+    parser.add_argument(
+        "--from-windows",
+        type=Path,
+        default=None,
+        help="Optional lol_events_snapped.json with precomputed windows[]",
+    )
+    parser.add_argument(
         "--source",
         type=Path,
         default=None,
@@ -233,6 +293,27 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Overwrite existing lol_clips/manifest",
     )
+    parser.add_argument(
+        "--timeline-offset",
+        type=float,
+        default=0.0,
+        help=(
+            "Seconds to subtract from window start/end when seeking in source "
+            "(use when source is a VOD section whose t=0 is not VOD start)."
+        ),
+    )
+    parser.add_argument(
+        "--section-start",
+        type=float,
+        default=None,
+        help="Only cut windows overlapping [section-start, section-end] (absolute VOD time)",
+    )
+    parser.add_argument(
+        "--section-end",
+        type=float,
+        default=None,
+        help="Only cut windows overlapping [section-start, section-end] (absolute VOD time)",
+    )
     return parser
 
 
@@ -240,22 +321,39 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     dataset_dir = args.dataset_dir.resolve()
     events_path = (args.events or (dataset_dir / "lol_events.json")).resolve()
-    out_dir = dataset_dir / "lol_clips"
+    out_dir = (args.output_dir or (dataset_dir / "lol_clips")).resolve()
     manifest_path = out_dir / "clips.json"
 
     try:
-        payload = load_json(events_path)
         types = {t.strip().upper() for t in args.types.split(",") if t.strip()}
         if not types:
             raise ValueError("No event types selected")
 
-        events = collect_events(payload, types)
-        windows = merge_nearby(events, merge_gap=args.merge_gap)
+        if args.from_windows is not None:
+            snapped = load_json(args.from_windows.resolve())
+            windows = list(snapped.get("windows") or [])
+            events_path = Path(snapped.get("source_events") or args.from_windows)
+        else:
+            payload = load_json(events_path)
+            events = collect_events(payload, types)
+            windows = merge_nearby(events, merge_gap=args.merge_gap)
+
+        if args.section_start is not None and args.section_end is not None:
+            lo, hi = float(args.section_start), float(args.section_end)
+            windows = [
+                w
+                for w in windows
+                if not (float(w["end"]) < lo or float(w["start"]) > hi)
+            ]
+
         if args.max_clips and args.max_clips > 0:
             windows = windows[: args.max_clips]
 
+        timeline_offset = float(args.timeline_offset or 0.0)
+
         if args.dry_run:
-            print(f"Planned {len(windows)} clip(s) from {events_path}")
+            src_label = str(args.from_windows or events_path)
+            print(f"Planned {len(windows)} clip(s) from {src_label}")
             for index, window in enumerate(windows, start=1):
                 label = "+".join(dict.fromkeys(window.get("types") or [window["type"]]))
                 print(
@@ -274,29 +372,43 @@ def main(argv: list[str] | None = None) -> int:
             return 2
 
         out_dir.mkdir(parents=True, exist_ok=True)
+        assign_game_clip_indices(windows)
         clips: list[dict[str, Any]] = []
 
         for index, window in enumerate(windows, start=1):
-            label = "+".join(dict.fromkeys(window.get("types") or [window["type"]]))
-            filename = (
-                f"clip_{index:02d}_{label.lower()}_{format_timestamp(window['start'])}.mp4"
-            )
-            output = out_dir / filename
-            print(f"[{index}/{len(windows)}] {filename}")
-            cut_clip(source, output, window["start"], window["end"], reencode=args.reencode)
+            rel = clip_relpath(window)
+            output = out_dir / rel
+            output.parent.mkdir(parents=True, exist_ok=True)
+            local_start = max(0.0, float(window["start"]) - timeline_offset)
+            local_end = max(local_start + 0.1, float(window["end"]) - timeline_offset)
+            print(f"[{index}/{len(windows)}] {rel}")
+            cut_clip(source, output, local_start, local_end, reencode=args.reencode)
             clips.append(
                 {
                     "index": index,
+                    "gameIndex": window.get("gameIndex"),
+                    "clipIndexInGame": window.get("clipIndexInGame"),
                     "path": str(output),
-                    "filename": filename,
+                    "filename": rel.name,
+                    "relativePath": rel.as_posix(),
                     "start": window["start"],
                     "end": window["end"],
+                    "localStart": round(local_start, 3),
+                    "localEnd": round(local_end, 3),
+                    "timelineOffset": timeline_offset,
                     "duration": round(window["end"] - window["start"], 3),
                     "types": window.get("types") or [window["type"]],
                     "matchId": window.get("matchId"),
                     "champion": window.get("champion"),
+                    "opponentChampion": window.get("opponentChampion"),
+                    "win": window.get("win"),
+                    "queueId": window.get("queueId"),
+                    "teamPosition": window.get("teamPosition"),
                     "vodTime": window.get("vodTime"),
                     "gameTime": window.get("gameTime"),
+                    "transcript": window.get("transcript"),
+                    "startReason": window.get("startReason"),
+                    "endReason": window.get("endReason"),
                     "source_event_count": len(window.get("sources") or [window]),
                 }
             )
@@ -307,9 +419,14 @@ def main(argv: list[str] | None = None) -> int:
             "created_at": datetime.now(timezone.utc).isoformat(),
             "source_path": str(source),
             "events_path": str(events_path),
+            "from_windows": str(args.from_windows) if args.from_windows else None,
+            "output_dir": str(out_dir),
             "types": sorted(types),
             "merge_gap": args.merge_gap,
             "reencode": args.reencode,
+            "timeline_offset": timeline_offset,
+            "section_start": args.section_start,
+            "section_end": args.section_end,
             "clip_count": len(clips),
             "clips": clips,
         }

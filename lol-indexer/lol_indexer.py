@@ -110,7 +110,11 @@ def load_vod_timeline(vod_dir: Path) -> dict[str, Any]:
         raise FileNotFoundError(f"VOD directory not found: {vod_dir}")
 
     metadata_path = vod_dir / "metadata.json"
+    info_path = vod_dir / "source.info.json"
     ingest_path = vod_dir / "ingest.json"
+    if not metadata_path.is_file() and info_path.is_file():
+        # Cloud resume may only have yt-dlp's source.info.json.
+        metadata_path.write_bytes(info_path.read_bytes())
     if not metadata_path.is_file():
         raise FileNotFoundError(
             f"missing {metadata_path.name}; ingest the VOD first with ingest_vod.py"
@@ -236,6 +240,7 @@ def index_matches(
             gameCreation=info.get("gameCreation"),
             gameEndTimestamp=info.get("gameEndTimestamp"),
             participantId=int(participant_id) if participant_id is not None else None,
+            teamPosition=str(participant.get("teamPosition") or "") or None,
         )
 
         if participant_id is None:
@@ -243,12 +248,20 @@ def index_matches(
             summaries.append(summary)
             continue
 
+        champion_by_id: dict[int, str] = {}
+        for p in info.get("participants") or []:
+            pid = p.get("participantId")
+            cname = p.get("championName")
+            if pid is not None and cname:
+                champion_by_id[int(pid)] = str(cname)
+
         try:
             timeline = api.get_timeline(match_id)
             summary.events = extract_player_events(
                 timeline,
                 participant_id=int(participant_id),
                 team_id=int(team_id) if team_id is not None else None,
+                champion_by_id=champion_by_id,
             )
         except RiotAPIError as exc:
             summary.error = f"timeline unavailable: {exc}"

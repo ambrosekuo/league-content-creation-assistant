@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -96,16 +97,45 @@ def find_downloaded_source(folder: Path) -> Path:
     return max(candidates, key=lambda path: path.stat().st_size)
 
 
+def format_section_spec(start_seconds: float, end_seconds: float) -> str:
+    """yt-dlp --download-sections value, e.g. *1:00:00-4:00:00."""
+
+    def hms(total: float) -> str:
+        s = max(0, int(total))
+        hours, rem = divmod(s, 3600)
+        minutes, secs = divmod(rem, 60)
+        return f"{hours}:{minutes:02d}:{secs:02d}"
+
+    return f"*{hms(start_seconds)}-{hms(end_seconds)}"
+
+
+def fetch_vod_metadata(url: str) -> dict[str, Any]:
+    """Resolve VOD info without downloading media."""
+    options: dict[str, Any] = {
+        "quiet": True,
+        "no_warnings": True,
+        "skip_download": True,
+        "noplaylist": True,
+    }
+    with YoutubeDL(options) as ydl:
+        info = ydl.extract_info(url, download=False)
+        return ydl.sanitize_info(info)
+
+
 def download_vod(
     url: str,
     folder: Path,
     cookies_from_browser: str | None,
     force: bool,
+    *,
+    format_selector: str = "best",
+    section_start: float | None = None,
+    section_end: float | None = None,
 ) -> tuple[Path, dict[str, Any]]:
     output_template = str(folder / "source.%(ext)s")
 
     options: dict[str, Any] = {
-        "format": "best",
+        "format": format_selector,
         "outtmpl": output_template,
         "writethumbnail": True,
         "writeinfojson": True,
@@ -114,7 +144,24 @@ def download_vod(
         "noplaylist": True,
         "quiet": False,
         "no_warnings": False,
+        # FixupM3u8 remuxes HLS → mp4 via ffmpeg into a *.temp.mp4 alongside the
+        # download. On Cloud Run that means ~2× file size in memory-backed /tmp
+        # (17GiB VOD → SIGBUS). Skip fixup; ffmpeg stream-copy cuts still work.
+        "fixup": "never",
     }
+    if section_start is not None and section_end is not None:
+        # Python API uses download_ranges (not the CLI --download-sections string list).
+        from yt_dlp.utils import download_range_func
+
+        spec = format_section_spec(section_start, section_end)
+        options["download_ranges"] = download_range_func(
+            None, [(float(section_start), float(section_end))]
+        )
+        # Avoid ffmpeg re-encode (force_keyframes_at_cuts); keep fragment speed.
+        print(
+            f"[ingest] section {spec} ({section_start:.0f}s–{section_end:.0f}s)",
+            flush=True,
+        )
 
     if cookies_from_browser:
         # yt-dlp expects a tuple such as ("chrome",) or ("firefox",).
@@ -193,6 +240,36 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Overwrite/redownload existing outputs.",
     )
+    parser.add_argument(
+        "--format",
+        default=None,
+        help=(
+            "yt-dlp format selector (default: env YTDLP_FORMAT or 'best'). "
+            "Cloud jobs should use e.g. best[height<=720]/best[height<=720]/best."
+        ),
+    )
+    parser.add_argument(
+        "--skip-audio",
+        action="store_true",
+        help="Skip PCM audio.wav extraction (cloud archive does not need it).",
+    )
+    parser.add_argument(
+        "--metadata-only",
+        action="store_true",
+        help="Fetch yt-dlp metadata.json only (no media download).",
+    )
+    parser.add_argument(
+        "--section-start",
+        type=float,
+        default=None,
+        help="Download only this VOD window start (seconds).",
+    )
+    parser.add_argument(
+        "--section-end",
+        type=float,
+        default=None,
+        help="Download only this VOD window end (seconds).",
+    )
     return parser.parse_args()
 
 
@@ -218,17 +295,66 @@ def main() -> int:
     try:
         extractor_metadata: dict[str, Any] | None = None
 
+        format_selector = (
+            args.format
+            or os.environ.get("YTDLP_FORMAT")
+            or "best"
+        )
+
+        if args.url and args.metadata_only:
+            print("[ingest] metadata-only", flush=True)
+            extractor_metadata = fetch_vod_metadata(args.url)
+            (folder / "metadata.json").write_text(
+                json.dumps(extractor_metadata, indent=2, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            print(
+                json.dumps(
+                    {
+                        "status": "ok",
+                        "dataset_id": dataset_id,
+                        "folder": str(folder),
+                        "duration": extractor_metadata.get("duration"),
+                        "title": extractor_metadata.get("title"),
+                    },
+                    indent=2,
+                )
+            )
+            return 0
+
         if args.url:
+            if (args.section_start is None) ^ (args.section_end is None):
+                print("Provide both --section-start and --section-end.", file=sys.stderr)
+                return 2
+            print(f"[ingest] yt-dlp format={format_selector}", flush=True)
             source, extractor_metadata = download_vod(
                 url=args.url,
                 folder=folder,
                 cookies_from_browser=args.cookies_from_browser,
                 force=args.force,
+                format_selector=format_selector,
+                section_start=args.section_start,
+                section_end=args.section_end,
             )
             (folder / "metadata.json").write_text(
                 json.dumps(extractor_metadata, indent=2, ensure_ascii=False),
                 encoding="utf-8",
             )
+            if args.section_start is not None and args.section_end is not None:
+                (folder / "section.json").write_text(
+                    json.dumps(
+                        {
+                            "start": args.section_start,
+                            "end": args.section_end,
+                            "spec": format_section_spec(
+                                args.section_start, args.section_end
+                            ),
+                        },
+                        indent=2,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
             source_type = "twitch_vod"
         else:
             source = ingest_local(
@@ -241,7 +367,10 @@ def main() -> int:
 
         media_probe = probe_media(source)
         audio_path = folder / "audio.wav"
-        extract_audio(source, audio_path, force=args.force)
+        if args.skip_audio:
+            print("[ingest] skipping audio.wav extraction", flush=True)
+        else:
+            extract_audio(source, audio_path, force=args.force)
 
         duration_string = media_probe.get("format", {}).get("duration")
         duration_seconds = float(duration_string) if duration_string else None
@@ -253,7 +382,8 @@ def main() -> int:
             "source_type": source_type,
             "source_url": args.url,
             "source_path": str(source),
-            "audio_path": str(audio_path),
+            "audio_path": str(audio_path) if audio_path.is_file() else None,
+            "ytdlp_format": format_selector if args.url else None,
             "duration_seconds": duration_seconds,
             "ffprobe": media_probe,
         }
