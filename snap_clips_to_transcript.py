@@ -323,7 +323,7 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Output JSON (default: <dataset>/lol_events_snapped.json)",
     )
-    p.add_argument("--types", default="KILL,DEATH")
+    p.add_argument("--types", default="KILL,DEATH,ASSIST")
     p.add_argument(
         "--pre-roll",
         type=float,
@@ -333,15 +333,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--post-roll",
         type=float,
-        default=6.0,
-        help="Seconds after event (default: 6; center-on-event mode)",
+        default=10.0,
+        help="Seconds after event (default: 10; center-on-event mode)",
     )
     p.add_argument("--max-expand", type=float, default=8.0)
     p.add_argument(
         "--max-duration",
         type=float,
-        default=18.0,
-        help="Hard max clip length in seconds (default: 18)",
+        default=22.0,
+        help="Hard max clip length in seconds (default: 22)",
     )
     p.add_argument(
         "--min-gap",
@@ -353,7 +353,19 @@ def build_parser() -> argparse.ArgumentParser:
         "--merge-gap",
         type=float,
         default=0.0,
-        help="Merge nearby windows within N seconds (default: 0 = no merge)",
+        help="Merge nearby windows within N seconds (default: 0 = no gap-merge)",
+    )
+    p.add_argument(
+        "--overlap-merge",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Merge overlapping/near-touching windows (default: on)",
+    )
+    p.add_argument(
+        "--overlap-slack",
+        type=float,
+        default=1.0,
+        help="With overlap-merge, treat gaps <= N seconds as overlap (default: 1)",
     )
     p.add_argument(
         "--center-on-event",
@@ -393,6 +405,58 @@ def merge_nearby(items: list[dict[str, Any]], merge_gap: float) -> list[dict[str
             cur = dict(item)
             cur["types"] = [cur["type"]]
             cur["sources"] = [item]
+    merged.append(cur)
+    return merged
+
+
+def merge_overlapping_windows(
+    items: list[dict[str, Any]],
+    *,
+    slack: float = 1.0,
+) -> list[dict[str, Any]]:
+    """
+    Collapse windows that overlap or nearly touch.
+
+    Stops near-duplicate clips when kills/deaths land a few seconds apart
+    (same fight, almost the same footage).
+    """
+    if not items:
+        return items
+    items = sorted(items, key=lambda x: (float(x["start"]), float(x["end"])))
+    merged: list[dict[str, Any]] = []
+    cur = dict(items[0])
+    cur["types"] = list(cur.get("types") or [cur["type"]])
+    cur["sources"] = list(cur.get("sources") or [items[0]])
+    for item in items[1:]:
+        if float(item["start"]) <= float(cur["end"]) + slack:
+            cur["end"] = max(float(cur["end"]), float(item["end"]))
+            cur["start"] = min(float(cur["start"]), float(item["start"]))
+            cur["types"].extend(item.get("types") or [item["type"]])
+            cur["sources"].extend(item.get("sources") or [item])
+            # Keep earliest primary event metadata for labeling.
+            if float(item.get("vodOffsetSeconds") or 1e18) < float(
+                cur.get("vodOffsetSeconds") or 1e18
+            ):
+                for key in (
+                    "type",
+                    "vodOffsetSeconds",
+                    "vodTime",
+                    "gameTime",
+                    "opponentChampion",
+                    "matchId",
+                    "champion",
+                ):
+                    if key in item:
+                        cur[key] = item[key]
+            cur["startReason"] = f"{cur.get('startReason')}+overlap_merge"
+            cur["endReason"] = f"{cur.get('endReason')}+overlap_merge"
+            cur["clipStart"] = format_hms(float(cur["start"]))
+            cur["clipEnd"] = format_hms(float(cur["end"]))
+        else:
+            merged.append(cur)
+            cur = dict(item)
+            cur["types"] = list(item.get("types") or [item["type"]])
+            cur["sources"] = list(item.get("sources") or [item])
     merged.append(cur)
     return merged
 
@@ -471,10 +535,35 @@ def main(argv: list[str] | None = None) -> int:
                 )
 
         windows = merge_nearby(refined, merge_gap=args.merge_gap)
+        if args.overlap_merge:
+            before = len(windows)
+            windows = merge_overlapping_windows(windows, slack=args.overlap_slack)
+            if len(windows) != before:
+                print(
+                    f"[snap] overlap-merge {before} → {len(windows)} windows",
+                    flush=True,
+                )
         # After merge, recompute combined transcript span text lightly.
         for w in windows:
-            w["duration"] = round(w["end"] - w["start"], 3)
+            # Cap merged fights that blew past max_duration.
+            start = float(w["start"])
+            end = float(w["end"])
+            event_t = float(w.get("vodOffsetSeconds") or ((start + end) / 2.0))
+            if end - start > args.max_duration:
+                half = args.max_duration / 2.0
+                start = max(0.0, event_t - half)
+                end = start + args.max_duration
+                w["start"] = round(start, 3)
+                w["end"] = round(end, 3)
+                w["endReason"] = f"{w.get('endReason')}+trim_merged_max"
+            w["duration"] = round(float(w["end"]) - float(w["start"]), 3)
             w["types"] = list(dict.fromkeys(w.get("types") or [w["type"]]))
+            w["clipStart"] = format_hms(float(w["start"]))
+            w["clipEnd"] = format_hms(float(w["end"]))
+            # Refresh transcript for final span.
+            w["transcript"] = _transcript_for_span(
+                segments, float(w["start"]), float(w["end"])
+            )
 
         out = {
             "schema_version": 1,
@@ -488,6 +577,8 @@ def main(argv: list[str] | None = None) -> int:
             "max_expand": args.max_expand,
             "max_duration": args.max_duration,
             "merge_gap": args.merge_gap,
+            "overlap_merge": bool(args.overlap_merge),
+            "overlap_slack": args.overlap_slack,
             "center_on_event": bool(args.center_on_event),
             "speech_nudge": args.speech_nudge if args.center_on_event else None,
             "window_count": len(windows),

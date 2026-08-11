@@ -280,6 +280,52 @@ def extract_player_events(
     return events
 
 
+def add_game_bookend_events(
+    events: list[PlayerEvent],
+    *,
+    timeline: dict[str, Any],
+    game_duration_seconds: int,
+    win: bool,
+) -> list[PlayerEvent]:
+    """
+    Ensure GAME_START + GAME_END bookends exist.
+
+    GAME_END prefers timeline GAME_END (nexus / victory screen), else duration.
+    """
+    out = list(events)
+    has_start = any(e.type == "GAME_START" for e in out)
+    has_end = any(e.type == "GAME_END" for e in out)
+
+    if not has_start:
+        out.append(
+            PlayerEvent(
+                type="GAME_START",
+                gameTimeMs=0,
+                gameTime=format_mmss(0),
+            )
+        )
+
+    if not has_end:
+        end_ms = max(0, int(game_duration_seconds) * 1000)
+        frames = (timeline.get("info") or {}).get("frames") or []
+        for frame in frames:
+            for event in frame.get("events") or []:
+                if event.get("type") == "GAME_END" and event.get("timestamp") is not None:
+                    end_ms = int(event["timestamp"])
+                    break
+        out.append(
+            PlayerEvent(
+                type="GAME_END",
+                gameTimeMs=end_ms,
+                gameTime=format_mmss(end_ms),
+                opponentChampion="WIN" if win else "LOSS",
+            )
+        )
+
+    out.sort(key=lambda e: e.gameTimeMs)
+    return out
+
+
 def apply_video_offsets(
     events: list[PlayerEvent],
     game_start_ms: int,

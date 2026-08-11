@@ -107,13 +107,15 @@ gcloud run jobs create vod-archive-nightly \
   --args="cloud_job.py,nightly,--limit,3,--cleanup"
 ```
 
-> Long VODs (~12h): keep `--task-timeout=24h`, gen2 + ≥24Gi for ~18GiB 720p. `YTDLP_FORMAT` defaults to 720p in `cloud_job.py`. Cloud ingest uses `--skip-audio`.
+> Long VODs (~12h): keep `--task-timeout=24h`, gen2 + ≥24Gi. `YTDLP_FORMAT` defaults to **1080p** in `cloud_job.py` (override with env). Cloud ingest uses `--skip-audio`.
 >
-> **Transcript snap (default ON):** after Riot index, cloud runs `transcribe_event_windows.py` (whisper only around KILL/DEATH, not the full VOD) → `snap_clips_to_transcript.py` → cut from snapped windows. Set `TRANSCRIPT_SNAP=0` to skip. Outputs `transcript.json` + `lol_events_snapped.json` to GCS with the archive.
+> **Transcript snap (default ON):** after Riot index, cloud runs `transcribe_event_windows.py` (whisper only around KILL/DEATH/ASSIST, not the full VOD) → `snap_clips_to_transcript.py` → cut from snapped windows. Set `TRANSCRIPT_SNAP=0` to skip. Outputs `transcript.json` + `lol_events_snapped.json` to GCS with the archive.
 >
-> **Default archive path:** full 720p HLS download → GCS checkpoint → Riot index → event-window ASR → **center-on-event snap** (~8s pre / 6s post, max 18s, soft speech nudge) → cut. Prefer this over segmented downloads (section re-encode is far slower than HLS).
+> **Default archive path:** full 1080p HLS download → GCS checkpoint → Riot index → event-window ASR → **center-on-event snap** (~8s pre / 10s post, max 22s, overlap-merge nearby fights, frame-accurate reencode cuts) → cut. Prefer this over segmented downloads (section re-encode is far slower than HLS).
 >
 > **Recut existing archives** (no Twitch re-download): `python cloud_job.py recut-clips --vod-id <id> --cleanup` reuses `source.mp4` + `transcript.json` from GCS, replaces `lol_clips/`.
+>
+> **Clip post-process job** (separate from archive): `python cloud_job.py process-clips --vod-id <id> --cleanup` downloads `lol_clips/` (+ events sidecars), generates a ~3s lobby-card intro per game, stitches each `gNN_Champ/` folder into `lol_compilations/{folder}_weave.mp4`, uploads weaves. Cloud Run job example: `vod-clip-process` (needs `RIOT_API_KEY` secret for lobby cards).
 
 ### Manual test (dry-run, no download)
 

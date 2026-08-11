@@ -178,6 +178,24 @@ class RiotAPI:
         encoded = urllib.parse.quote(match_id, safe="")
         return self._request(f"/lol/match/v5/matches/{encoded}/timeline")
 
+    def get_league_entries_by_puuid(
+        self,
+        puuid: str,
+        *,
+        platform: str = "na1",
+    ) -> list[dict[str, Any]]:
+        """Platform routing (na1/euw1/…). Returns ranked queue entries."""
+        encoded = urllib.parse.quote(puuid, safe="")
+        path = f"/lol/league/v4/entries/by-puuid/{encoded}"
+        # Temporarily hit platform host instead of regional routing.
+        original = self.base_url
+        self.base_url = f"https://{platform.strip().lower()}.api.riotgames.com"
+        try:
+            result = self._request(path)
+        finally:
+            self.base_url = original
+        return list(result or [])
+
 
 def _parse_retry_after(value: str | None) -> float | None:
     if value is None:

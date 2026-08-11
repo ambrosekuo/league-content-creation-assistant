@@ -14,6 +14,7 @@ import os
 import subprocess
 import sys
 import tempfile
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -103,7 +104,17 @@ def _write_archive_manifest(dataset_dir: Path, vod_id: str) -> Path:
     from datetime import datetime, timezone
 
     events_path = dataset_dir / "lol_events.json"
-    clips_manifest = dataset_dir / "lol_clips" / "clips.json"
+    clips_subdir = "lol_clips"
+    marker = dataset_dir / ".cut_run.json"
+    if marker.is_file():
+        try:
+            clips_subdir = str(
+                json.loads(marker.read_text(encoding="utf-8")).get("clips_subdir")
+                or "lol_clips"
+            )
+        except (OSError, json.JSONDecodeError):
+            pass
+    clips_manifest = dataset_dir / clips_subdir / "clips.json"
     meta_path = dataset_dir / "metadata.json"
 
     events_payload: dict[str, Any] = {}
@@ -186,6 +197,83 @@ def _transcript_snap_enabled() -> bool:
     }
 
 
+def _resolve_clips_outdir(
+    dataset_dir: Path,
+    *,
+    versioned: bool,
+    resume: bool,
+    clips_subdir: str | None,
+) -> Path:
+    """Pick lol_clips or lol_clips_<timestamp>; resume unfinished run via marker."""
+    marker = dataset_dir / ".cut_run.json"
+    if clips_subdir:
+        out = dataset_dir / clips_subdir
+        out.mkdir(parents=True, exist_ok=True)
+        marker.write_text(
+            json.dumps(
+                {
+                    "clips_subdir": clips_subdir,
+                    "complete": False,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return out
+
+    if resume and marker.is_file():
+        try:
+            data = json.loads(marker.read_text(encoding="utf-8"))
+            if not data.get("complete") and data.get("clips_subdir"):
+                prev = dataset_dir / str(data["clips_subdir"])
+                if prev.is_dir():
+                    print(f"[cut] resume folder {prev.name}", flush=True)
+                    return prev
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    base = dataset_dir / "lol_clips"
+    has_clips = base.is_dir() and any(base.rglob("c*.mp4"))
+    if versioned and has_clips:
+        name = f"lol_clips_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%SZ')}"
+        print(f"[cut] existing lol_clips/ → versioned {name}", flush=True)
+    else:
+        name = "lol_clips"
+    out = dataset_dir / name
+    out.mkdir(parents=True, exist_ok=True)
+    marker.write_text(
+        json.dumps(
+            {
+                "clips_subdir": name,
+                "complete": False,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return out
+
+
+def _mark_cut_complete(dataset_dir: Path, clips_dir: Path) -> None:
+    marker = dataset_dir / ".cut_run.json"
+    marker.write_text(
+        json.dumps(
+            {
+                "clips_subdir": clips_dir.name,
+                "complete": True,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def _cut_clips(
     dataset_dir: Path,
     *,
@@ -193,19 +281,48 @@ def _cut_clips(
     max_clips: int,
     force: bool,
     from_windows: Path | None = None,
-) -> None:
-    if force:
-        clips_dir = dataset_dir / "lol_clips"
-        if clips_dir.is_dir():
-            import shutil
+    reencode: bool = True,
+    resume: bool = False,
+    versioned: bool = False,
+    clips_subdir: str | None = None,
+    publish_gcs_vod_id: str | None = None,
+    clear_local: bool = True,
+) -> Path:
+    import shutil
 
+    clips_dir = _resolve_clips_outdir(
+        dataset_dir,
+        versioned=versioned,
+        resume=resume,
+        clips_subdir=clips_subdir,
+    )
+    if clear_local and force and not resume and clips_dir.name == "lol_clips":
+        if clips_dir.is_dir():
             shutil.rmtree(clips_dir)
+            clips_dir.mkdir(parents=True, exist_ok=True)
             print(f"[cut] cleared {clips_dir}", flush=True)
+
+    # Publish run marker early so a cancel can resume from GCS.
+    if publish_gcs_vod_id:
+        import storage_gcs as gcs
+
+        marker = dataset_dir / ".cut_run.json"
+        if marker.is_file():
+            day = gcs.resolve_day_key(publish_gcs_vod_id, dataset_dir)
+            base = gcs.vod_prefix(publish_gcs_vod_id, day_key=day)
+            gcs.upload_file(
+                marker,
+                f"{base}/.cut_run.json",
+                content_type="application/json",
+            )
+
     cmd = [
         sys.executable,
         str(ROOT / "cut_lol_clips.py"),
         "--dataset-dir",
         str(dataset_dir),
+        "--output-dir",
+        str(clips_dir),
         "--types",
         types,
     ]
@@ -213,9 +330,18 @@ def _cut_clips(
         cmd.extend(["--from-windows", str(from_windows)])
     if max_clips > 0:
         cmd.extend(["--max-clips", str(max_clips)])
-    if force:
+    if force and not resume:
         cmd.append("--force")
+    if resume:
+        cmd.append("--resume")
+        cmd.append("--force")  # allow rewriting clips.json while skipping mp4s
+    if reencode:
+        cmd.append("--reencode")
+    if publish_gcs_vod_id:
+        cmd.extend(["--publish-gcs-vod-id", publish_gcs_vod_id])
     _run(cmd)
+    _mark_cut_complete(dataset_dir, clips_dir)
+    return clips_dir
 
 
 def cmd_recut_clips(args: argparse.Namespace) -> int:
@@ -224,6 +350,9 @@ def cmd_recut_clips(args: argparse.Namespace) -> int:
 
     Uses source.mp4 + lol_events.json + transcript.json when present, then
     replaces lol_clips/ + lol_events_snapped.json in the archive.
+
+    --fast: stream-copy cuts, versioned folder, publish each clip to GCS,
+    resume skipped files after cancel.
     """
     import shutil
 
@@ -233,6 +362,13 @@ def cmd_recut_clips(args: argparse.Namespace) -> int:
     work_dir = Path(os.environ.get("WORK_DIR") or args.work_dir or "/tmp/vod-work")
     work_dir.mkdir(parents=True, exist_ok=True)
     dataset_dir = (Path(args.dataset_dir).resolve() if args.dataset_dir else work_dir / vod_id)
+    fast = bool(getattr(args, "fast", False))
+    resume = bool(getattr(args, "resume", False) or fast)
+    versioned = bool(getattr(args, "versioned", False) or fast)
+    reencode = bool(getattr(args, "reencode", True))
+    if fast:
+        reencode = False  # stream-copy
+    publish = bool(getattr(args, "publish_incremental", False) or fast)
 
     if args.dataset_dir:
         if not dataset_dir.is_dir():
@@ -243,25 +379,31 @@ def cmd_recut_clips(args: argparse.Namespace) -> int:
             raise FileNotFoundError(
                 f"No GCS source.mp4 for {vod_id}; cannot recut without a Twitch re-download"
             )
-        if dataset_dir.exists() and args.clean_work:
+        # Resume/fast: keep local work dir so we can skip already-cut mp4s.
+        if dataset_dir.exists() and args.clean_work and not resume:
             shutil.rmtree(dataset_dir, ignore_errors=True)
         gcs.restore_source_checkpoint(vod_id, dataset_dir)
         source_origin = "gcs_checkpoint"
+        if resume or fast:
+            restored_subdir = gcs.restore_cut_run_progress(vod_id, dataset_dir)
+            if restored_subdir and not getattr(args, "clips_subdir", None):
+                args.clips_subdir = restored_subdir
 
     events_path = dataset_dir / "lol_events.json"
-    if not events_path.is_file():
-        print(f"[index] {vod_id}", flush=True)
-        _run(
-            [
-                sys.executable,
-                str(ROOT / "lol-indexer" / "lol_indexer.py"),
-                "--vod-dir",
-                str(dataset_dir),
-                "--output",
-                str(events_path),
-            ],
-            cwd=ROOT / "lol-indexer",
-        )
+    # Always re-index on recut so overlap/bookend fixes land in GCS
+    # (stale lol_events.json would permanently drop games that started before the VOD).
+    print(f"[index] {vod_id} (refresh)", flush=True)
+    _run(
+        [
+            sys.executable,
+            str(ROOT / "lol-indexer" / "lol_indexer.py"),
+            "--vod-dir",
+            str(dataset_dir),
+            "--output",
+            str(events_path),
+        ],
+        cwd=ROOT / "lol-indexer",
+    )
 
     from_windows: Path | None = None
     if _transcript_snap_enabled():
@@ -269,26 +411,124 @@ def cmd_recut_clips(args: argparse.Namespace) -> int:
     else:
         print("[snap] TRANSCRIPT_SNAP disabled; cutting raw Riot windows", flush=True)
 
-    print(f"[cut] {vod_id}", flush=True)
-    _cut_clips(
+    # If GCS already has lol_clips/ and we're versioning, force a timestamp folder
+    # even when local work dir is empty (Cloud Run clean restore).
+    clips_subdir = getattr(args, "clips_subdir", None)
+    if versioned and not clips_subdir:
+        base = dataset_dir / "lol_clips"
+        local_has = base.is_dir() and any(base.rglob("c*.mp4"))
+        remote_has = False
+        try:
+            day = gcs.resolve_day_key(vod_id, dataset_dir)
+            remote_has = gcs.blob_exists(
+                f"{gcs.vod_prefix(vod_id, day_key=day)}/lol_clips/clips.json"
+            )
+        except Exception:
+            remote_has = False
+        if local_has or remote_has:
+            clips_subdir = (
+                f"lol_clips_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%SZ')}"
+            )
+            print(f"[cut] versioned output → {clips_subdir}", flush=True)
+
+    mode = "stream-copy/fast" if not reencode else "reencode"
+    print(f"[cut] {vod_id} ({mode}, resume={resume}, versioned={versioned})", flush=True)
+    clips_dir = _cut_clips(
         dataset_dir,
         types=args.types,
         max_clips=args.max_clips,
         force=True,
         from_windows=from_windows,
+        reencode=reencode,
+        resume=resume,
+        versioned=versioned,
+        clips_subdir=clips_subdir,
+        publish_gcs_vod_id=vod_id if publish else None,
+        clear_local=not resume and not versioned,
     )
     _write_archive_manifest(dataset_dir, vod_id)
 
-    print(f"[upload] clip artifacts only for {vod_id}", flush=True)
-    uploaded = gcs.upload_clip_artifacts(dataset_dir, vod_id=vod_id)
+    print(f"[upload] sidecars for {vod_id}", flush=True)
+    uploaded = gcs.upload_clip_artifacts(
+        dataset_dir,
+        vod_id=vod_id,
+        clips_subdir=clips_dir.name,
+        replace_clips_prefix=not publish,
+    )
     result = {
         "status": "recut",
         "vodId": vod_id,
         "sourceOrigin": source_origin,
         "uploaded": len(uploaded),
         "transcriptSnap": bool(from_windows),
-        "clipsDir": str(dataset_dir / "lol_clips"),
-        "clipsPrefix": f"gs://{gcs.bucket_name()}/{gcs.vod_prefix(vod_id, dataset_dir=dataset_dir)}/lol_clips/",
+        "fast": fast,
+        "reencode": reencode,
+        "resume": resume,
+        "clipsDir": str(clips_dir),
+        "clipsPrefix": (
+            f"gs://{gcs.bucket_name()}/"
+            f"{gcs.vod_prefix(vod_id, dataset_dir=dataset_dir)}/{clips_dir.name}/"
+        ),
+    }
+    if args.cleanup and not args.dataset_dir and not resume:
+        # Keep work dir when resuming is likely; cleanup only for finished one-shots.
+        shutil.rmtree(dataset_dir, ignore_errors=True)
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+def cmd_process_clips(args: argparse.Namespace) -> int:
+    """
+    Post-process existing lol_clips/ in GCS (no Twitch / no source.mp4).
+
+    Current tasks:
+      - generate lobby card intro (~3s) per game
+      - stitch each gNN_Champ folder into lol_compilations/{folder}_weave.mp4
+    """
+    import shutil
+
+    import storage_gcs as gcs
+
+    vod_id = str(args.vod_id).strip().lstrip("v")
+    work_dir = Path(os.environ.get("WORK_DIR") or args.work_dir or "/tmp/vod-work")
+    work_dir.mkdir(parents=True, exist_ok=True)
+    dataset_dir = Path(args.dataset_dir).resolve() if args.dataset_dir else work_dir / vod_id
+
+    if args.dataset_dir:
+        if not (dataset_dir / "lol_clips").is_dir():
+            raise FileNotFoundError(f"Missing lol_clips in {dataset_dir}")
+        origin = "dataset_dir"
+    else:
+        if dataset_dir.exists() and args.clean_work:
+            shutil.rmtree(dataset_dir, ignore_errors=True)
+        print(f"[restore] lol_clips for {vod_id}", flush=True)
+        gcs.restore_clips_prefix(vod_id, dataset_dir)
+        origin = "gcs_clips"
+
+    stitch_cmd = [
+        sys.executable,
+        str(ROOT / "stitch_game_clips.py"),
+        "--dataset-dir",
+        str(dataset_dir),
+        "--min-clips",
+        str(args.min_clips),
+        "--force",
+    ]
+    if args.reencode:
+        stitch_cmd.append("--reencode")
+    print(f"[stitch] {vod_id}", flush=True)
+    _run(stitch_cmd)
+
+    print(f"[upload] compilations for {vod_id}", flush=True)
+    uploaded = gcs.upload_compilation_artifacts(dataset_dir, vod_id=vod_id)
+    prefix = gcs.vod_prefix(vod_id, dataset_dir=dataset_dir)
+    result = {
+        "status": "process_clips",
+        "vodId": vod_id,
+        "origin": origin,
+        "uploaded": len(uploaded),
+        "compilationsPrefix": f"gs://{gcs.bucket_name()}/{prefix}/lol_compilations/",
+        "objects": uploaded,
     }
     if args.cleanup and not args.dataset_dir:
         shutil.rmtree(dataset_dir, ignore_errors=True)
@@ -298,9 +538,10 @@ def cmd_recut_clips(args: argparse.Namespace) -> int:
 
 def _snap_clips_with_transcript(dataset_dir: Path, *, types: str) -> Path:
     """Event-window ASR (if needed) → center-on-event snap → lol_events_snapped.json."""
+    allowed = {"KILL", "DEATH", "ASSIST"}
     snap_types = ",".join(
-        t for t in (x.strip().upper() for x in types.split(",")) if t in {"KILL", "DEATH"}
-    ) or "KILL,DEATH"
+        t for t in (x.strip().upper() for x in types.split(",")) if t in allowed
+    ) or "KILL,DEATH,ASSIST"
 
     transcript_path = dataset_dir / "transcript.json"
     if transcript_path.is_file():
@@ -325,7 +566,7 @@ def _snap_clips_with_transcript(dataset_dir: Path, *, types: str) -> Path:
 
     snapped = dataset_dir / "lol_events_snapped.json"
     print(
-        f"[snap] {dataset_dir.name} (center-on-event ~8s+6s, max 18s, soft nudge)",
+        f"[snap] {dataset_dir.name} (center-on-event ~8s+10s, max 22s, overlap-merge)",
         flush=True,
     )
     _run(
@@ -340,13 +581,16 @@ def _snap_clips_with_transcript(dataset_dir: Path, *, types: str) -> Path:
             "--pre-roll",
             "8",
             "--post-roll",
-            "6",
+            "10",
             "--max-duration",
-            "18",
+            "22",
             "--speech-nudge",
             "2",
             "--merge-gap",
             "0",
+            "--overlap-merge",
+            "--overlap-slack",
+            "1",
             "--output",
             str(snapped),
         ]
@@ -361,6 +605,7 @@ def _finalize_and_upload(
     cut_clips: bool,
     clip_types: str,
     max_clips: int,
+    fast: bool = False,
 ) -> dict[str, Any]:
     import storage_gcs as gcs
 
@@ -387,30 +632,50 @@ def _finalize_and_upload(
             # Don't lose the archive if ASR fails — fall back to raw Riot cuts.
             print(f"[snap] failed, falling back to raw cuts: {exc}", flush=True)
             from_windows = None
+    elif cut_clips and not _transcript_snap_enabled():
+        print("[snap] TRANSCRIPT_SNAP disabled; cutting raw Riot windows", flush=True)
 
+    reencode = not fast
+    resume = fast
+    publish = fast
+    clips_dir: Path | None = None
     if cut_clips:
-        print(f"[cut] {vod_id}", flush=True)
-        _cut_clips(
+        mode = "stream-copy/fast" if fast else "reencode"
+        print(f"[cut] {vod_id} ({mode})", flush=True)
+        clips_dir = _cut_clips(
             dataset_dir,
             types=clip_types,
             max_clips=max_clips,
             force=True,
             from_windows=from_windows,
+            reencode=reencode,
+            resume=resume,
+            versioned=False,
+            publish_gcs_vod_id=vod_id if publish else None,
+            clear_local=not resume,
         )
 
     print(f"[manifest] {vod_id}", flush=True)
     _write_archive_manifest(dataset_dir, vod_id)
 
     print(f"[upload] {vod_id}", flush=True)
-    uploaded = gcs.upload_dataset_dir(dataset_dir, vod_id=vod_id)
+    if fast and clips_dir is not None:
+        # Clips already published incrementally; finish with sidecars + source.
+        uploaded = gcs.upload_dataset_dir(dataset_dir, vod_id=vod_id)
+        clips_name = clips_dir.name
+    else:
+        uploaded = gcs.upload_dataset_dir(dataset_dir, vod_id=vod_id)
+        clips_name = "lol_clips"
     return {
         "status": "archived",
         "vodId": vod_id,
         "uploaded": len(uploaded),
-        "clipsDir": str(dataset_dir / "lol_clips"),
+        "clipsDir": str(dataset_dir / clips_name),
         "transcriptSnap": bool(from_windows),
+        "fast": fast,
+        "reencode": reencode if cut_clips else None,
         "archiveManifest": f"gs://{gcs.bucket_name()}/{gcs.vod_prefix(vod_id)}/archive_manifest.json",
-        "clipsPrefix": f"gs://{gcs.bucket_name()}/{gcs.vod_prefix(vod_id)}/lol_clips/",
+        "clipsPrefix": f"gs://{gcs.bucket_name()}/{gcs.vod_prefix(vod_id)}/{clips_name}/",
     }
 
 
@@ -456,7 +721,7 @@ def _ensure_source(
     # Cap quality in cloud: full "best" ~32GiB/12h blows Cloud Run /tmp (SIGBUS).
     fmt = os.environ.get(
         "YTDLP_FORMAT",
-        "best[height<=720]/best[height<=720]/best",
+        "best[height<=1080]/best[height<=1080]/best",
     )
     _run(
         [
@@ -512,10 +777,12 @@ def cmd_process_vod(args: argparse.Namespace) -> int:
         cut_clips=not args.skip_clips,
         clip_types=args.types,
         max_clips=args.max_clips,
+        fast=bool(getattr(args, "fast", False)),
     )
     result["sourceOrigin"] = source_origin
     # Cleanup only deletes the ephemeral local copy. GCS checkpoint remains.
-    if args.cleanup and not args.dataset_dir:
+    # Keep work dir on --fast so a cancelled cut can resume without re-download.
+    if args.cleanup and not args.dataset_dir and not getattr(args, "fast", False):
         import shutil
 
         shutil.rmtree(dataset_dir, ignore_errors=True)
@@ -766,7 +1033,7 @@ def cmd_process_segmented(args: argparse.Namespace) -> int:
 
     fmt = os.environ.get(
         "YTDLP_FORMAT",
-        "best[height<=720]/best[height<=720]/best",
+        "best[height<=1080]/best[height<=1080]/best",
     )
     results: list[dict[str, Any]] = []
 
@@ -893,13 +1160,14 @@ def cmd_process_segmented(args: argparse.Namespace) -> int:
                         "--pre-roll",
                         "8",
                         "--post-roll",
-                        "6",
+                        "10",
                         "--max-duration",
-                        "18",
+                        "22",
                         "--speech-nudge",
                         "2",
                         "--merge-gap",
                         "0",
+                        "--overlap-merge",
                         "--output",
                         str(snapped),
                     ]
@@ -925,6 +1193,7 @@ def cmd_process_segmented(args: argparse.Namespace) -> int:
                 "--section-end",
                 str(seg["coreEnd"]),
                 "--force",
+                "--reencode",
             ]
             if from_windows is not None:
                 cut_cmd.extend(["--from-windows", str(from_windows)])
@@ -1093,6 +1362,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_one.add_argument("--types", default="KILL,DEATH,ASSIST")
     p_one.add_argument("--max-clips", type=int, default=0)
     p_one.add_argument(
+        "--fast",
+        action="store_true",
+        help="Stream-copy cuts + incremental GCS publish (skip reencode; resumable)",
+    )
+    p_one.add_argument(
         "--cleanup",
         action="store_true",
         help="Delete local WORK_DIR copy after success (GCS checkpoint kept)",
@@ -1114,8 +1388,42 @@ def build_parser() -> argparse.ArgumentParser:
         help="Use existing local dataset (skip GCS source restore)",
     )
     p_recut.add_argument("--work-dir", type=Path, default=None)
-    p_recut.add_argument("--types", default="KILL,DEATH")
+    p_recut.add_argument("--types", default="KILL,DEATH,ASSIST")
     p_recut.add_argument("--max-clips", type=int, default=0)
+    p_recut.add_argument(
+        "--fast",
+        action="store_true",
+        help=(
+            "Stream-copy cuts (very fast), versioned lol_clips_<timestamp> if "
+            "lol_clips exists, publish each clip to GCS immediately, resume skips"
+        ),
+    )
+    p_recut.add_argument(
+        "--reencode",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Re-encode clips (default on). Disabled automatically by --fast.",
+    )
+    p_recut.add_argument(
+        "--resume",
+        action="store_true",
+        help="Continue an incomplete cut run (skip existing mp4s; implied by --fast)",
+    )
+    p_recut.add_argument(
+        "--versioned",
+        action="store_true",
+        help="Write to lol_clips_<timestamp> when lol_clips already has clips",
+    )
+    p_recut.add_argument(
+        "--clips-subdir",
+        default=None,
+        help="Explicit clips folder name under the dataset (e.g. lol_clips_20260811_191500Z)",
+    )
+    p_recut.add_argument(
+        "--publish-incremental",
+        action="store_true",
+        help="Upload each clip to GCS as soon as it is cut (implied by --fast)",
+    )
     p_recut.add_argument(
         "--clean-work",
         action="store_true",
@@ -1127,6 +1435,44 @@ def build_parser() -> argparse.ArgumentParser:
         help="Delete local WORK_DIR copy after upload",
     )
     p_recut.set_defaults(func=cmd_recut_clips)
+
+    p_clips = sub.add_parser(
+        "process-clips",
+        help=(
+            "Post-process GCS lol_clips/ (no Twitch download): "
+            "stitch each game folder into lol_compilations/*_weave.mp4"
+        ),
+    )
+    p_clips.add_argument("--vod-id", required=True)
+    p_clips.add_argument(
+        "--dataset-dir",
+        type=Path,
+        default=None,
+        help="Use local dataset with lol_clips/ (skip GCS restore)",
+    )
+    p_clips.add_argument("--work-dir", type=Path, default=None)
+    p_clips.add_argument(
+        "--min-clips",
+        type=int,
+        default=2,
+        help="Skip games with fewer than N clips (default: 2)",
+    )
+    p_clips.add_argument(
+        "--reencode",
+        action="store_true",
+        help="Force re-encode when stitching (default: try stream copy)",
+    )
+    p_clips.add_argument(
+        "--clean-work",
+        action="store_true",
+        help="Wipe local WORK_DIR/<vodId> before restoring clips from GCS",
+    )
+    p_clips.add_argument(
+        "--cleanup",
+        action="store_true",
+        help="Delete local WORK_DIR copy after upload",
+    )
+    p_clips.set_defaults(func=cmd_process_clips)
 
     p_seg = sub.add_parser(
         "process-segmented",

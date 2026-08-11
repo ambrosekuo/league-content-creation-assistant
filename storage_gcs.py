@@ -381,11 +381,137 @@ def restore_source_checkpoint(vod_id: str, dataset_dir: Path) -> Path:
     return local_source
 
 
-def upload_clip_artifacts(dataset_dir: Path, *, vod_id: str | None = None) -> dict[str, str]:
+def download_prefix(object_prefix: str, local_dir: Path, *, suffix: str | None = None) -> list[Path]:
+    """Download all objects under a GCS prefix into local_dir (preserving relative paths)."""
+    client = _client()
+    bucket = client.bucket(bucket_name())
+    local_dir.mkdir(parents=True, exist_ok=True)
+    downloaded: list[Path] = []
+    for blob in client.list_blobs(bucket, prefix=object_prefix):
+        name = blob.name
+        if name.endswith("/"):
+            continue
+        if suffix and not name.endswith(suffix):
+            continue
+        rel = name[len(object_prefix) :].lstrip("/")
+        if not rel:
+            continue
+        dest = local_dir / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        print(f"[download] gs://{bucket_name()}/{name} → {dest}", flush=True)
+        blob.download_to_filename(str(dest))
+        downloaded.append(dest)
+    return downloaded
+
+
+def restore_clips_prefix(
+    vod_id: str,
+    dataset_dir: Path,
+    *,
+    clips_subdir: str = "lol_clips",
+) -> Path:
+    """Download a clips folder (+ metadata sidecars) for clip post-processing. No source.mp4."""
+    vid = vod_id.strip().lstrip("v")
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    day = resolve_day_key(vid, dataset_dir)
+    base = vod_prefix(vid, day_key=day)
+    clips_remote = f"{base}/{clips_subdir.strip('/')}/"
+    clips_local = dataset_dir / clips_subdir
+    files = download_prefix(clips_remote, clips_local)
+    if not files:
+        raise FileNotFoundError(f"No clips under gs://{bucket_name()}/{clips_remote}")
+
+    for name in (
+        "metadata.json",
+        "lol_events.json",
+        "lol_events_snapped.json",
+        "archive_manifest.json",
+        ".cut_run.json",
+    ):
+        dest = dataset_dir / name
+        if dest.is_file():
+            continue
+        remote = f"{base}/{name}"
+        if blob_exists(remote):
+            download_file(remote, dest)
+    return clips_local
+
+
+def restore_cut_run_progress(vod_id: str, dataset_dir: Path) -> str | None:
+    """
+    If GCS has an incomplete .cut_run.json, restore it + any already-published clips
+    so a cancelled Cloud Run job can resume without redoing finished mp4s.
+    """
+    vid = vod_id.strip().lstrip("v")
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    day = resolve_day_key(vid, dataset_dir)
+    base = vod_prefix(vid, day_key=day)
+    remote_marker = f"{base}/.cut_run.json"
+    local_marker = dataset_dir / ".cut_run.json"
+    if not blob_exists(remote_marker):
+        return None
+    download_file(remote_marker, local_marker)
+    try:
+        data = json.loads(local_marker.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if data.get("complete"):
+        return None
+    subdir = str(data.get("clips_subdir") or "").strip()
+    if not subdir:
+        return None
+    remote_clips = f"{base}/{subdir}/"
+    local_clips = dataset_dir / subdir
+    files = download_prefix(remote_clips, local_clips)
+    print(
+        f"[resume] restored {len(files)} object(s) under {subdir}/ from GCS",
+        flush=True,
+    )
+    return subdir
+
+
+def upload_compilation_artifacts(dataset_dir: Path, *, vod_id: str | None = None) -> dict[str, str]:
+    """Upload lol_compilations/ only (does not touch lol_clips/ or source)."""
+    dataset_dir = dataset_dir.resolve()
+    vid = (vod_id or dataset_dir.name).strip().lstrip("v")
+    day = resolve_day_key(vid, dataset_dir)
+    base = vod_prefix(vid, day_key=day)
+    uploaded: dict[str, str] = {}
+
+    comp_dir = dataset_dir / "lol_compilations"
+    if not comp_dir.is_dir():
+        return uploaded
+
+    remote_prefix = f"{base}/lol_compilations/"
+    removed = delete_prefix(remote_prefix)
+    if removed:
+        print(f"[upload] cleared {removed} old object(s) under {remote_prefix}", flush=True)
+
+    for path in sorted(p for p in comp_dir.rglob("*") if p.is_file()):
+        rel = path.relative_to(dataset_dir).as_posix()
+        object_name = f"{base}/{rel}"
+        content_type = "application/json" if path.suffix.lower() == ".json" else None
+        if path.suffix.lower() == ".mp4":
+            content_type = "video/mp4"
+        elif path.suffix.lower() == ".png":
+            content_type = "image/png"
+        print(f"[upload] {rel}", flush=True)
+        uploaded[rel] = upload_file(path, object_name, content_type=content_type)
+    return uploaded
+
+
+def upload_clip_artifacts(
+    dataset_dir: Path,
+    *,
+    vod_id: str | None = None,
+    clips_subdir: str = "lol_clips",
+    replace_clips_prefix: bool = True,
+) -> dict[str, str]:
     """
     Re-upload snap/cut outputs without touching source.mp4.
 
-    Replaces lol_clips/ in GCS so old long clips do not linger under new names.
+    By default replaces the clips prefix in GCS. For incremental/versioned runs
+    set replace_clips_prefix=False (clips already published one-by-one).
     """
     dataset_dir = dataset_dir.resolve()
     vid = (vod_id or dataset_dir.name).strip().lstrip("v")
@@ -393,17 +519,20 @@ def upload_clip_artifacts(dataset_dir: Path, *, vod_id: str | None = None) -> di
     base = vod_prefix(vid, day_key=day)
     uploaded: dict[str, str] = {}
 
-    clips_prefix = f"{base}/lol_clips/"
-    removed = delete_prefix(clips_prefix)
-    if removed:
-        print(f"[upload] cleared {removed} old object(s) under {clips_prefix}", flush=True)
+    clips_prefix = f"{base}/{clips_subdir.strip('/')}/"
+    if replace_clips_prefix:
+        removed = delete_prefix(clips_prefix)
+        if removed:
+            print(f"[upload] cleared {removed} old object(s) under {clips_prefix}", flush=True)
 
     targets = [
+        dataset_dir / "lol_events.json",
         dataset_dir / "lol_events_snapped.json",
         dataset_dir / "archive_manifest.json",
         dataset_dir / "_upload_manifest.json",
+        dataset_dir / ".cut_run.json",
     ]
-    clips_dir = dataset_dir / "lol_clips"
+    clips_dir = dataset_dir / clips_subdir
     if clips_dir.is_dir():
         targets.extend(sorted(p for p in clips_dir.rglob("*") if p.is_file()))
 

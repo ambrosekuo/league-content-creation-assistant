@@ -14,6 +14,7 @@ from typing import Any
 from models import (
     IndexResult,
     MatchSummary,
+    add_game_bookend_events,
     apply_video_offsets,
     extract_player_events,
     parse_iso_datetime,
@@ -163,14 +164,27 @@ def match_in_window(
     game_start_ms: int,
     start_dt: datetime | None,
     end_dt: datetime | None,
+    *,
+    game_duration_seconds: float | None = None,
 ) -> bool:
-    """Return True if match game start falls within the optional window."""
+    """
+    True if the match overlaps the optional [start, end] window.
+
+    Uses overlap (not start-only) so games already in progress when a VOD
+    begins are still indexed.
+    """
     if start_dt is None and end_dt is None:
         return True
-    ts = game_start_ms / 1000.0
-    if start_dt is not None and ts < start_dt.timestamp():
+    game_start = game_start_ms / 1000.0
+    duration = float(game_duration_seconds or 0.0)
+    if duration < 0:
+        duration = 0.0
+    game_end = game_start + duration
+    window_start = start_dt.timestamp() if start_dt is not None else None
+    window_end = end_dt.timestamp() if end_dt is not None else None
+    if window_end is not None and game_start > window_end:
         return False
-    if end_dt is not None and ts > end_dt.timestamp():
+    if window_start is not None and game_end < window_start:
         return False
     return True
 
@@ -207,7 +221,19 @@ def index_matches(
             continue
 
         game_start_ms = int(game_start)
-        if not match_in_window(game_start_ms, start_dt, end_dt):
+        # Duration needed early for overlap filtering (games already running at VOD start).
+        duration = info.get("gameDuration")
+        if duration is not None and int(duration) > 100_000:
+            duration_seconds = int(duration) // 1000
+        else:
+            duration_seconds = int(duration or 0)
+
+        if not match_in_window(
+            game_start_ms,
+            start_dt,
+            end_dt,
+            game_duration_seconds=duration_seconds,
+        ):
             continue
 
         participant = find_participant(match, puuid)
@@ -220,12 +246,6 @@ def index_matches(
 
         participant_id = participant.get("participantId")
         team_id = participant.get("teamId")
-        duration = info.get("gameDuration")
-        # gameDuration is usually seconds; some older payloads used ms.
-        if duration is not None and int(duration) > 100_000:
-            duration_seconds = int(duration) // 1000
-        else:
-            duration_seconds = int(duration or 0)
 
         summary = MatchSummary(
             matchId=match_id,
@@ -262,6 +282,12 @@ def index_matches(
                 participant_id=int(participant_id),
                 team_id=int(team_id) if team_id is not None else None,
                 champion_by_id=champion_by_id,
+            )
+            summary.events = add_game_bookend_events(
+                summary.events,
+                timeline=timeline,
+                game_duration_seconds=duration_seconds,
+                win=summary.win,
             )
         except RiotAPIError as exc:
             summary.error = f"timeline unavailable: {exc}"
@@ -425,6 +451,10 @@ def main(argv: list[str] | None = None) -> int:
 
     start_epoch = to_epoch_seconds(start_dt) if start_dt else None
     end_epoch = to_epoch_seconds(end_dt) if end_dt else None
+    # Pad match-ID query so games already in progress at VOD start are listed.
+    id_start_epoch = start_epoch
+    if args.vod_dir and start_epoch is not None:
+        id_start_epoch = start_epoch - 45 * 60
     # For a VOD window, fetch enough match IDs to cover a long stream.
     fetch_count = min(max(args.count, 1), 100)
     if args.vod_dir:
@@ -435,7 +465,7 @@ def main(argv: list[str] | None = None) -> int:
             puuid,
             count=fetch_count,
             start=0,
-            start_time=start_epoch,
+            start_time=id_start_epoch,
             end_time=end_epoch,
         )
     except RiotAuthError as exc:

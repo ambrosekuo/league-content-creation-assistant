@@ -112,7 +112,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument("--dataset-dir", type=Path, required=True)
     p.add_argument("--events", type=Path, default=None)
-    p.add_argument("--types", default="KILL,DEATH")
+    p.add_argument("--types", default="KILL,DEATH,ASSIST")
     p.add_argument("--pre-roll", type=float, default=25.0)
     p.add_argument("--post-roll", type=float, default=20.0)
     p.add_argument(

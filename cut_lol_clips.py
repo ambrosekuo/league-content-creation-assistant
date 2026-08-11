@@ -194,36 +194,48 @@ def merge_nearby(events: list[dict[str, Any]], merge_gap: float) -> list[dict[st
 
 def cut_clip(source: Path, output: Path, start: float, end: float, reencode: bool) -> None:
     duration = max(0.1, end - start)
-    command = [
-        "ffmpeg",
-        "-y",
-        "-ss",
-        f"{start:.3f}",
-        "-i",
-        str(source),
-        "-t",
-        f"{duration:.3f}",
-    ]
     if reencode:
-        command.extend(
-            [
-                "-c:v",
-                "libx264",
-                "-preset",
-                "veryfast",
-                "-crf",
-                "18",
-                "-c:a",
-                "aac",
-                "-b:a",
-                "192k",
-                "-movflags",
-                "+faststart",
-            ]
-        )
+        # Seek after -i for frame-accurate cuts (avoids frozen first second
+        # from keyframe-aligned stream copy).
+        command = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            str(source),
+            "-ss",
+            f"{start:.3f}",
+            "-t",
+            f"{duration:.3f}",
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "18",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "192k",
+            "-movflags",
+            "+faststart",
+            str(output),
+        ]
     else:
-        command.extend(["-c", "copy"])
-    command.append(str(output))
+        command = [
+            "ffmpeg",
+            "-y",
+            "-ss",
+            f"{start:.3f}",
+            "-i",
+            str(source),
+            "-t",
+            f"{duration:.3f}",
+            "-c",
+            "copy",
+            "-avoid_negative_ts",
+            "make_zero",
+            str(output),
+        ]
     run(command)
 
 
@@ -291,7 +303,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--force",
         action="store_true",
-        help="Overwrite existing lol_clips/manifest",
+        help="Overwrite existing lol_clips/manifest (ignored with --resume for existing mp4s)",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip clip files that already exist; rewrite clips.json as you go",
+    )
+    parser.add_argument(
+        "--publish-gcs-vod-id",
+        default=None,
+        help="After each clip is cut, upload it to GCS under this VOD id",
     )
     parser.add_argument(
         "--timeline-offset",
@@ -364,9 +386,10 @@ def main(argv: list[str] | None = None) -> int:
             return 0
 
         source = find_source(dataset_dir, args.source)
-        if manifest_path.exists() and not args.force:
+        if manifest_path.exists() and not args.force and not args.resume:
             print(
-                f"clips.json already exists: {manifest_path}\nPass --force to overwrite.",
+                f"clips.json already exists: {manifest_path}\n"
+                "Pass --force to overwrite, or --resume to continue.",
                 file=sys.stderr,
             )
             return 2
@@ -374,6 +397,49 @@ def main(argv: list[str] | None = None) -> int:
         out_dir.mkdir(parents=True, exist_ok=True)
         assign_game_clip_indices(windows)
         clips: list[dict[str, Any]] = []
+        skipped = 0
+        cut_count = 0
+        publish = bool(args.publish_gcs_vod_id)
+        gcs_mod = None
+        gcs_base = ""
+        if publish:
+            sys.path.insert(0, str(Path(__file__).resolve().parent))
+            import storage_gcs as gcs_mod  # type: ignore
+
+            vid = str(args.publish_gcs_vod_id).strip().lstrip("v")
+            day = gcs_mod.resolve_day_key(vid, dataset_dir)
+            gcs_base = gcs_mod.vod_prefix(vid, day_key=day)
+
+        def write_manifest() -> None:
+            manifest = {
+                "schema_version": 1,
+                "dataset_id": dataset_dir.name,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+                "source_path": str(source),
+                "events_path": str(events_path),
+                "from_windows": str(args.from_windows) if args.from_windows else None,
+                "output_dir": str(out_dir),
+                "types": sorted(types),
+                "merge_gap": args.merge_gap,
+                "reencode": args.reencode,
+                "resume": bool(args.resume),
+                "timeline_offset": timeline_offset,
+                "section_start": args.section_start,
+                "section_end": args.section_end,
+                "clip_count": len(clips),
+                "clips": clips,
+            }
+            manifest_path.write_text(
+                json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
+                encoding="utf-8",
+            )
+            if publish and gcs_mod is not None:
+                rel_manifest = manifest_path.relative_to(dataset_dir).as_posix()
+                gcs_mod.upload_file(
+                    manifest_path,
+                    f"{gcs_base}/{rel_manifest}",
+                    content_type="application/json",
+                )
 
         for index, window in enumerate(windows, start=1):
             rel = clip_relpath(window)
@@ -381,8 +447,23 @@ def main(argv: list[str] | None = None) -> int:
             output.parent.mkdir(parents=True, exist_ok=True)
             local_start = max(0.0, float(window["start"]) - timeline_offset)
             local_end = max(local_start + 0.1, float(window["end"]) - timeline_offset)
-            print(f"[{index}/{len(windows)}] {rel}")
-            cut_clip(source, output, local_start, local_end, reencode=args.reencode)
+            reused = args.resume and output.is_file() and output.stat().st_size > 10_000
+            if reused:
+                print(f"[{index}/{len(windows)}] skip (exists) {rel}", flush=True)
+                skipped += 1
+            else:
+                print(f"[{index}/{len(windows)}] {rel}", flush=True)
+                cut_clip(source, output, local_start, local_end, reencode=args.reencode)
+                cut_count += 1
+                if publish and gcs_mod is not None:
+                    rel_ds = output.relative_to(dataset_dir).as_posix()
+                    print(f"[publish] gs://{gcs_mod.bucket_name()}/{gcs_base}/{rel_ds}", flush=True)
+                    gcs_mod.upload_file(
+                        output,
+                        f"{gcs_base}/{rel_ds}",
+                        content_type="video/mp4",
+                    )
+
             clips.append(
                 {
                     "index": index,
@@ -410,31 +491,25 @@ def main(argv: list[str] | None = None) -> int:
                     "startReason": window.get("startReason"),
                     "endReason": window.get("endReason"),
                     "source_event_count": len(window.get("sources") or [window]),
+                    "resumed": reused,
                 }
             )
+            # Persist progress so a cancel can resume mid-run.
+            write_manifest()
 
-        manifest = {
-            "schema_version": 1,
-            "dataset_id": dataset_dir.name,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "source_path": str(source),
-            "events_path": str(events_path),
-            "from_windows": str(args.from_windows) if args.from_windows else None,
-            "output_dir": str(out_dir),
-            "types": sorted(types),
-            "merge_gap": args.merge_gap,
-            "reencode": args.reencode,
-            "timeline_offset": timeline_offset,
-            "section_start": args.section_start,
-            "section_end": args.section_end,
-            "clip_count": len(clips),
-            "clips": clips,
-        }
-        manifest_path.write_text(
-            json.dumps(manifest, indent=2, ensure_ascii=False) + "\n",
-            encoding="utf-8",
+        print(
+            json.dumps(
+                {
+                    "status": "ok",
+                    "clip_count": len(clips),
+                    "cut_count": cut_count,
+                    "skipped_existing": skipped,
+                    "dir": str(out_dir),
+                    "reencode": bool(args.reencode),
+                },
+                indent=2,
+            )
         )
-        print(json.dumps({"status": "ok", "clip_count": len(clips), "dir": str(out_dir)}, indent=2))
         return 0
 
     except Exception as exc:
