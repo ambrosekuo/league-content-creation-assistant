@@ -24,6 +24,8 @@ gs://$GCS_BUCKET/vods/{dayKey}/{vodId}/   # e.g. vods/aug09_2026/2841932660/
   transcript.json              # event-window ASR (when TRANSCRIPT_SNAP=1)
   lol_events_snapped.json
   lol_clips/…
+  lol_compilations/…           # per-game weaves (process-clips)
+  lol_compilations_portrait/…  # 9:16 facecam+KDA (process-portraits)
   archive_manifest.json
 
 gs://$GCS_BUCKET/work/{dayKey}/{vodId}/   # resume copies
@@ -116,6 +118,11 @@ gcloud run jobs create vod-archive-nightly \
 > **Recut existing archives** (no Twitch re-download): `python cloud_job.py recut-clips --vod-id <id> --cleanup` reuses `source.mp4` + `transcript.json` from GCS, replaces `lol_clips/`.
 >
 > **Clip post-process job** (separate from archive): `python cloud_job.py process-clips --vod-id <id> --cleanup` downloads `lol_clips/` (+ events sidecars), generates a ~3s lobby-card intro per game, stitches each `gNN_Champ/` folder into `lol_compilations/{folder}_weave.mp4`, uploads weaves. Cloud Run job example: `vod-clip-process` (needs `RIOT_API_KEY` secret for lobby cards).
+>
+> **Portrait post-process job** (separate): `python cloud_job.py process-portraits --vod-id <id> --cleanup` downloads `lol_compilations/gam*.mp4` (or legacy `*_weave.mp4`), renders 9:16 facecam+KDA portraits into `lol_compilations_portrait/`, uploads. Job: `vod-portrait-process` — see `deploy/create_portrait_job.example.sh`. No Riot key needed.
+>
+> **Chain clips → portraits:** deploy `./deploy/deploy_clip_then_portrait_workflow.sh`, then  
+> `gcloud workflows run clip-then-portrait --location=us-east1 --data='{"vodId":"YOUR_VOD"}'`.
 
 ### Manual test (dry-run, no download)
 

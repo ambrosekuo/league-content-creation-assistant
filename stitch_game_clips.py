@@ -16,6 +16,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from clip_edge_pad import PAD_LEAD_S, PAD_TRAIL_S
+
 ROOT = Path(__file__).resolve().parent
 
 
@@ -85,6 +87,7 @@ def match_id_for_folder(
         payload = load_json(path)
         matches = list(payload.get("matches") or [])
         # Same naming as cut_lol_clips: chronological game index + champion
+        # (+ optional _vsLaneOpponent).
         timed: list[tuple[float, dict[str, Any]]] = []
         for m in matches:
             offs = [
@@ -96,10 +99,68 @@ def match_id_for_folder(
         timed.sort(key=lambda t: t[0])
         for i, (_, m) in enumerate(timed, start=1):
             champ = "".join(ch for ch in str(m.get("champion") or "Unknown") if ch.isalnum()) or "Unknown"
-            if f"g{i:02d}_{champ}" == folder:
+            prefix = f"g{i:02d}_{champ}"
+            if folder == prefix or folder.startswith(f"{prefix}_vs"):
                 mid = m.get("matchId")
                 return str(mid) if mid else None
     return None
+
+
+def _safe_name(value: str | None, *, fallback: str = "unknown") -> str:
+    text = "".join(ch for ch in str(value or "") if ch.isalnum())
+    return (text or fallback).lower()
+
+
+def match_meta_for_folder(
+    folder: str,
+    dataset_dir: Path,
+    manifest: dict[str, Any] | None,
+) -> dict[str, Any]:
+    """Champion / lane opponent / win for weave naming."""
+    mid = match_id_for_folder(folder, dataset_dir, manifest)
+    meta: dict[str, Any] = {"matchId": mid, "champion": None, "laneOpponentChampion": None, "win": None}
+    if manifest:
+        for item in manifest.get("clips") or []:
+            rel = str(item.get("relativePath") or "")
+            if not rel.startswith(f"{folder}/"):
+                continue
+            meta["champion"] = item.get("champion") or meta["champion"]
+            meta["laneOpponentChampion"] = (
+                item.get("laneOpponentChampion") or meta["laneOpponentChampion"]
+            )
+            if item.get("win") is not None:
+                meta["win"] = bool(item.get("win"))
+            break
+    if mid:
+        for name in ("lol_events.json", "lol_events_snapped.json"):
+            path = dataset_dir / name
+            if not path.is_file():
+                continue
+            for m in load_json(path).get("matches") or []:
+                if str(m.get("matchId")) != str(mid):
+                    continue
+                meta["champion"] = m.get("champion") or meta["champion"]
+                meta["laneOpponentChampion"] = (
+                    m.get("laneOpponentChampion") or meta["laneOpponentChampion"]
+                )
+                if m.get("win") is not None:
+                    meta["win"] = bool(m.get("win"))
+                return meta
+    # Fallback parse folder g01_Leblanc_vsAhri
+    parts = folder.split("_", 2)
+    if len(parts) >= 2 and parts[0].startswith("g"):
+        meta["champion"] = meta["champion"] or parts[1]
+        if len(parts) >= 3 and parts[2].startswith("vs"):
+            meta["laneOpponentChampion"] = meta["laneOpponentChampion"] or parts[2][2:]
+    return meta
+
+
+def weave_output_name(game_index: int, meta: dict[str, Any]) -> str:
+    """e.g. gam01_leblanc_vs_ahri_win.mp4"""
+    champ = _safe_name(meta.get("champion"), fallback="unknown")
+    opp = _safe_name(meta.get("laneOpponentChampion"), fallback="unknown")
+    result = "win" if meta.get("win") else "loss"
+    return f"gam{game_index:02d}_{champ}_vs_{opp}_{result}.mp4"
 
 
 def probe_video(path: Path) -> dict[str, Any]:
@@ -112,6 +173,8 @@ def probe_video(path: Path) -> dict[str, Any]:
             "v:0",
             "-show_entries",
             "stream=width,height,r_frame_rate",
+            "-show_entries",
+            "format=duration",
             "-of",
             "json",
             str(path),
@@ -120,7 +183,7 @@ def probe_video(path: Path) -> dict[str, Any]:
         capture_output=True,
     )
     if proc.returncode != 0:
-        return {"width": 1920, "height": 1080, "fps": 30.0}
+        return {"width": 1920, "height": 1080, "fps": 30.0, "duration": 0.0}
     data = json.loads(proc.stdout or "{}")
     streams = data.get("streams") or [{}]
     s0 = streams[0] if streams else {}
@@ -132,10 +195,15 @@ def probe_video(path: Path) -> dict[str, Any]:
             fps = float(num) / max(float(den), 1.0)
         except ValueError:
             fps = 30.0
+    try:
+        duration = float((data.get("format") or {}).get("duration") or 0.0)
+    except (TypeError, ValueError):
+        duration = 0.0
     return {
         "width": int(s0.get("width") or 1920),
         "height": int(s0.get("height") or 1080),
         "fps": max(1.0, min(fps, 60.0)),
+        "duration": max(0.0, duration),
     }
 
 
@@ -229,13 +297,21 @@ def stitch_one(
     width: int | None = None,
     height: int | None = None,
     fps: float | None = None,
+    trim_lead: float = 0.0,
+    trim_trail: float = 0.0,
 ) -> dict[str, Any]:
     """
     Concatenate clips. When reencode=True (required for lobby intros), use
     filter_complex concat so video/audio stay aligned — concat demuxer often
     leaves the still lobby on screen while the next clip's audio starts.
+
+    ``trim_lead`` / ``trim_trail`` drop the first/last N seconds of each
+    non-lobby clip (skips frozen open/close frames from seek-based cuts).
+    Cut pads by the same amounts so snap pre/post-roll is preserved.
     """
     output.parent.mkdir(parents=True, exist_ok=True)
+    lead = max(0.0, float(trim_lead))
+    trail = max(0.0, float(trim_trail))
 
     if reencode:
         probe = probe_video(clips[0])
@@ -251,13 +327,38 @@ def stitch_one(
             cmd.extend(["-i", str(clip)])
 
         filter_parts: list[str] = []
-        for i in range(len(clips)):
+        for i, clip in enumerate(clips):
+            is_lobby = "lobby" in clip.name.lower()
+            clip_lead = 0.0 if is_lobby else lead
+            clip_trail = 0.0 if is_lobby else trail
+            if clip_lead > 0 or clip_trail > 0:
+                dur = float(probe_video(clip).get("duration") or 0.0)
+                end = dur - clip_trail if (clip_trail > 0 and dur > 0) else 0.0
+                if end > clip_lead + 0.1:
+                    v_head = (
+                        f"trim=start={clip_lead:.3f}:end={end:.3f},"
+                        f"setpts=PTS-STARTPTS,"
+                    )
+                    a_head = (
+                        f"atrim=start={clip_lead:.3f}:end={end:.3f},"
+                        f"asetpts=PTS-STARTPTS,"
+                    )
+                elif clip_lead > 0:
+                    v_head = f"trim=start={clip_lead:.3f},setpts=PTS-STARTPTS,"
+                    a_head = f"atrim=start={clip_lead:.3f},asetpts=PTS-STARTPTS,"
+                else:
+                    v_head = "setpts=PTS-STARTPTS,"
+                    a_head = "asetpts=PTS-STARTPTS,"
+            else:
+                v_head = "setpts=PTS-STARTPTS,"
+                a_head = "asetpts=PTS-STARTPTS,"
             filter_parts.append(
-                f"[{i}:v]scale={w}:{h}:force_original_aspect_ratio=decrease,"
+                f"[{i}:v]{v_head}"
+                f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
                 f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=0x0A0C12,"
-                f"fps={rate:.3f},setsar=1,setpts=PTS-STARTPTS[v{i}];"
-                f"[{i}:a]aformat=sample_rates=48000:channel_layouts=stereo,"
-                f"asetpts=PTS-STARTPTS[a{i}];"
+                f"fps={rate:.3f},setsar=1[v{i}];"
+                f"[{i}:a]{a_head}"
+                f"aformat=sample_rates=48000:channel_layouts=stereo[a{i}];"
             )
         concat_in = "".join(f"[v{i}][a{i}]" for i in range(len(clips)))
         filter_complex = (
@@ -289,6 +390,8 @@ def stitch_one(
         )
         run(cmd)
         mode = "filter_concat"
+        if lead > 0 or trail > 0:
+            mode = f"filter_concat_trim_lead_{lead:.2f}s_trail_{trail:.2f}s"
     else:
         list_path = output.with_suffix(".concat.txt")
         lines = []
@@ -396,6 +499,26 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Skip lobby card intro even if --lobby-seconds > 0",
     )
+    p.add_argument(
+        "--trim-lead",
+        type=float,
+        default=PAD_LEAD_S,
+        help=(
+            f"Seconds to drop from the start of each gameplay clip when "
+            f"re-encoding/stitching (default: {PAD_LEAD_S}). Must match cut "
+            f"--pad-lead. Lobby intro is never trimmed. Use 0 to disable."
+        ),
+    )
+    p.add_argument(
+        "--trim-trail",
+        type=float,
+        default=PAD_TRAIL_S,
+        help=(
+            f"Seconds to drop from the end of each gameplay clip when "
+            f"re-encoding/stitching (default: {PAD_TRAIL_S}). Must match cut "
+            f"--pad-trail. Lobby intro is never trimmed. Use 0 to disable."
+        ),
+    )
     return p
 
 
@@ -431,7 +554,25 @@ def main(argv: list[str] | None = None) -> int:
         if len(clips) < args.min_clips:
             print(f"[skip] {folder}: only {len(clips)} clip(s)", flush=True)
             continue
-        output = out_dir / f"{folder}_weave.mp4"
+
+        # Prefer clipIndex / gameIndex from manifest for stable gamNN naming.
+        game_index = 1
+        if manifest:
+            for item in manifest.get("clips") or []:
+                rel = str(item.get("relativePath") or "")
+                if rel.startswith(f"{folder}/") and item.get("gameIndex"):
+                    game_index = int(item["gameIndex"])
+                    break
+        else:
+            # g01_Leblanc_vsX → 1
+            try:
+                game_index = int(folder.split("_", 1)[0].lstrip("g"))
+            except ValueError:
+                game_index = 1
+
+        meta = match_meta_for_folder(folder, dataset_dir, manifest)
+        weave_name = weave_output_name(game_index, meta)
+        output = out_dir / weave_name
         if output.exists() and not args.force:
             print(f"[skip] exists {output.name} (pass --force)", flush=True)
             weaves.append(
@@ -441,6 +582,8 @@ def main(argv: list[str] | None = None) -> int:
                     "filename": output.name,
                     "clipCount": len(clips),
                     "skipped": True,
+                    "laneOpponentChampion": meta.get("laneOpponentChampion"),
+                    "win": meta.get("win"),
                 }
             )
             continue
@@ -451,12 +594,12 @@ def main(argv: list[str] | None = None) -> int:
         probe = probe_video(clips[0])
 
         if want_lobby:
-            match_id = match_id_for_folder(folder, dataset_dir, manifest)
+            match_id = meta.get("matchId") or match_id_for_folder(folder, dataset_dir, manifest)
             if not match_id:
                 print(f"[lobby] skip {folder}: no matchId mapping", flush=True)
             else:
                 try:
-                    lobby_png = out_dir / f"{folder}_lobby.png"
+                    lobby_png = out_dir / f"{Path(weave_name).stem}_lobby.png"
                     print(f"[lobby] {folder} match={match_id}", flush=True)
                     generate_lobby_png(match_id, lobby_png)
                     with tempfile.TemporaryDirectory(prefix=f"lobby_{folder}_") as tmp:
@@ -469,8 +612,7 @@ def main(argv: list[str] | None = None) -> int:
                             height=int(probe["height"]),
                             fps=float(probe["fps"]),
                         )
-                        # Keep a durable copy next to the weave for debugging
-                        durable = out_dir / f"{folder}_lobby_intro.mp4"
+                        durable = out_dir / f"{Path(weave_name).stem}_lobby_intro.mp4"
                         durable.write_bytes(lobby_mp4.read_bytes())
                         stitch_clips = [durable] + stitch_clips
                     lobby_meta = {
@@ -478,7 +620,7 @@ def main(argv: list[str] | None = None) -> int:
                         "matchId": match_id,
                         "seconds": float(args.lobby_seconds),
                         "png": lobby_png.name,
-                        "intro": f"{folder}_lobby_intro.mp4",
+                        "intro": durable.name,
                     }
                     force_reencode = True  # lobby + gameplay need synced filter concat
                 except Exception as exc:
@@ -493,8 +635,13 @@ def main(argv: list[str] | None = None) -> int:
             width=int(probe["width"]),
             height=int(probe["height"]),
             fps=float(probe["fps"]),
+            trim_lead=float(args.trim_lead),
+            trim_trail=float(args.trim_trail),
         )
         info["gameFolder"] = folder
+        info["filename"] = output.name
+        info["laneOpponentChampion"] = meta.get("laneOpponentChampion")
+        info["win"] = meta.get("win")
         info["lobby"] = lobby_meta
         weaves.append(info)
 
@@ -505,6 +652,8 @@ def main(argv: list[str] | None = None) -> int:
         "clips_dir": str(clips_dir),
         "output_dir": str(out_dir),
         "lobby_seconds": float(args.lobby_seconds) if want_lobby else 0,
+        "trim_lead": float(args.trim_lead),
+        "trim_trail": float(args.trim_trail),
         "game_count": len(weaves),
         "weaves": weaves,
     }

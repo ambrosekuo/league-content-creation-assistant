@@ -189,6 +189,27 @@ def match_in_window(
     return True
 
 
+def find_lane_opponent_champion(
+    match: dict[str, Any],
+    participant: dict[str, Any],
+) -> str | None:
+    """Enemy champ in the same role (TOP vs TOP, MIDDLE vs MIDDLE, …)."""
+    my_pos = str(participant.get("teamPosition") or "").strip().upper()
+    my_team = participant.get("teamId")
+    if not my_pos or my_team is None:
+        return None
+    info = match.get("info") or {}
+    for other in info.get("participants") or []:
+        if other.get("teamId") == my_team:
+            continue
+        if str(other.get("teamPosition") or "").strip().upper() != my_pos:
+            continue
+        name = other.get("championName")
+        if name:
+            return str(name)
+    return None
+
+
 def index_matches(
     api: RiotAPI,
     riot_id: str,
@@ -261,6 +282,7 @@ def index_matches(
             gameEndTimestamp=info.get("gameEndTimestamp"),
             participantId=int(participant_id) if participant_id is not None else None,
             teamPosition=str(participant.get("teamPosition") or "") or None,
+            laneOpponentChampion=find_lane_opponent_champion(match, participant),
         )
 
         if participant_id is None:

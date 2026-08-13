@@ -11,6 +11,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from clip_edge_pad import PAD_LEAD_S, PAD_TRAIL_S
 
 DEFAULT_TYPES = ("KILL", "DEATH", "ASSIST")
 
@@ -76,8 +77,7 @@ def clip_relpath(window: dict[str, Any]) -> Path:
     """
     Per-game folder + clip number for easy browse/stitch:
 
-      g01_Leblanc/c03_kill.mp4
-      g01_Leblanc/c03_kill_vsAhri.mp4   (when opponent known)
+      g01_Leblanc_vsAhri/c03_kill_vsZed.mp4
     """
     champ = safe_token(window.get("champion"))
     game_n = int(window.get("gameIndex") or 1)
@@ -86,9 +86,12 @@ def clip_relpath(window: dict[str, Any]) -> Path:
         dict.fromkeys(t.lower() for t in (window.get("types") or [window.get("type") or "event"]))
     )
     folder = f"g{game_n:02d}_{champ}"
+    lane_opp = window.get("laneOpponentChampion")
+    if lane_opp:
+        folder = f"{folder}_vs{safe_token(lane_opp)}"
     stem = f"c{clip_n:02d}_{label}"
     opponent = window.get("opponentChampion")
-    if opponent:
+    if opponent and str(opponent).upper() not in {"WIN", "LOSS"}:
         stem = f"{stem}_vs{safe_token(opponent)}"
     return Path(folder) / f"{stem}.mp4"
 
@@ -155,6 +158,7 @@ def collect_events(
                     "win": match.get("win"),
                     "queueId": match.get("queueId"),
                     "teamPosition": match.get("teamPosition"),
+                    "laneOpponentChampion": match.get("laneOpponentChampion"),
                     "opponentChampion": event.get("opponentChampion"),
                     "gameTime": event.get("gameTime"),
                     "vodTime": event.get("vodTime"),
@@ -192,35 +196,29 @@ def merge_nearby(events: list[dict[str, Any]], merge_gap: float) -> list[dict[st
     return merged
 
 
-def cut_clip(source: Path, output: Path, start: float, end: float, reencode: bool) -> None:
+def cut_clip(
+    source: Path,
+    output: Path,
+    start: float,
+    end: float,
+    reencode: bool,
+    *,
+    stream_copy: bool = False,
+    accurate: bool = False,
+) -> None:
+    """
+    Cut [start, end) from source.
+
+    Default: ``-ss`` *before* ``-i`` + libx264 ``superfast``. Fast on long VODs
+    (no decode-from-start) and avoids stream-copy frozen open frames.
+
+    ``accurate=True``: ``-ss`` after ``-i`` (frame-exact; slow on multi-hour sources).
+    ``reencode=True``: higher-quality ``veryfast`` preset (implies accurate seek).
+    ``stream_copy=True``: ``-c copy`` (fastest; can freeze until next keyframe).
+    """
     duration = max(0.1, end - start)
-    if reencode:
-        # Seek after -i for frame-accurate cuts (avoids frozen first second
-        # from keyframe-aligned stream copy).
-        command = [
-            "ffmpeg",
-            "-y",
-            "-i",
-            str(source),
-            "-ss",
-            f"{start:.3f}",
-            "-t",
-            f"{duration:.3f}",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "18",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
-            "-movflags",
-            "+faststart",
-            str(output),
-        ]
-    else:
+    if stream_copy and not reencode and not accurate:
+        # Fast but can freeze/hang the first frames until the next keyframe.
         command = [
             "ffmpeg",
             "-y",
@@ -236,6 +234,59 @@ def cut_clip(source: Path, output: Path, start: float, end: float, reencode: boo
             "make_zero",
             str(output),
         ]
+    else:
+        # accurate / reencode: seek after -i (exact, slow on long files).
+        # default: seek before -i (orders of magnitude faster on 9h VODs).
+        use_accurate_seek = accurate or reencode
+        preset = "veryfast" if reencode else "superfast"
+        if use_accurate_seek:
+            command = [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(source),
+                "-ss",
+                f"{start:.3f}",
+                "-t",
+                f"{duration:.3f}",
+                "-c:v",
+                "libx264",
+                "-preset",
+                preset,
+                "-crf",
+                "18",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-movflags",
+                "+faststart",
+                str(output),
+            ]
+        else:
+            command = [
+                "ffmpeg",
+                "-y",
+                "-ss",
+                f"{start:.3f}",
+                "-i",
+                str(source),
+                "-t",
+                f"{duration:.3f}",
+                "-c:v",
+                "libx264",
+                "-preset",
+                preset,
+                "-crf",
+                "18",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "192k",
+                "-movflags",
+                "+faststart",
+                str(output),
+            ]
     run(command)
 
 
@@ -293,7 +344,26 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--reencode",
         action="store_true",
-        help="Re-encode clips (slower, frame-accurate). Default is stream copy.",
+        help=(
+            "Higher-quality libx264 veryfast + frame-accurate seek after -i "
+            "(slow on long VODs)."
+        ),
+    )
+    parser.add_argument(
+        "--accurate",
+        action="store_true",
+        help=(
+            "Frame-exact seek (-ss after -i). Slow on multi-hour sources. "
+            "Default seeks before -i + superfast encode (much faster)."
+        ),
+    )
+    parser.add_argument(
+        "--stream-copy",
+        action="store_true",
+        help=(
+            "Use ffmpeg -c copy (fastest, but often freezes/hangs the first "
+            "frames until a keyframe). Not recommended for publishable clips."
+        ),
     )
     parser.add_argument(
         "--dry-run",
@@ -335,6 +405,25 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="Only cut windows overlapping [section-start, section-end] (absolute VOD time)",
+    )
+    parser.add_argument(
+        "--pad-lead",
+        type=float,
+        default=PAD_LEAD_S,
+        help=(
+            f"Extra seconds before each window start when cutting "
+            f"(default: {PAD_LEAD_S}). Must match stitch --trim-lead so "
+            f"snap pre-roll survives after stitch trim."
+        ),
+    )
+    parser.add_argument(
+        "--pad-trail",
+        type=float,
+        default=PAD_TRAIL_S,
+        help=(
+            f"Extra seconds after each window end when cutting "
+            f"(default: {PAD_TRAIL_S}). Must match stitch --trim-trail."
+        ),
     )
     return parser
 
@@ -396,6 +485,8 @@ def main(argv: list[str] | None = None) -> int:
 
         out_dir.mkdir(parents=True, exist_ok=True)
         assign_game_clip_indices(windows)
+        pad_lead = max(0.0, float(args.pad_lead))
+        pad_trail = max(0.0, float(args.pad_trail))
         clips: list[dict[str, Any]] = []
         skipped = 0
         cut_count = 0
@@ -422,10 +513,14 @@ def main(argv: list[str] | None = None) -> int:
                 "types": sorted(types),
                 "merge_gap": args.merge_gap,
                 "reencode": args.reencode,
+                "accurate": bool(args.accurate),
+                "stream_copy": bool(args.stream_copy),
                 "resume": bool(args.resume),
                 "timeline_offset": timeline_offset,
                 "section_start": args.section_start,
                 "section_end": args.section_end,
+                "pad_lead": pad_lead,
+                "pad_trail": pad_trail,
                 "clip_count": len(clips),
                 "clips": clips,
             }
@@ -445,15 +540,33 @@ def main(argv: list[str] | None = None) -> int:
             rel = clip_relpath(window)
             output = out_dir / rel
             output.parent.mkdir(parents=True, exist_ok=True)
-            local_start = max(0.0, float(window["start"]) - timeline_offset)
-            local_end = max(local_start + 0.1, float(window["end"]) - timeline_offset)
+            # Semantic window from snap; expand by pad so stitch trim keeps buffers.
+            local_start = max(0.0, float(window["start"]) - timeline_offset - pad_lead)
+            local_end = max(
+                local_start + 0.1,
+                float(window["end"]) - timeline_offset + pad_trail,
+            )
+            window_start = max(0.0, float(window["start"]) - timeline_offset)
+            window_end = max(window_start + 0.1, float(window["end"]) - timeline_offset)
             reused = args.resume and output.is_file() and output.stat().st_size > 10_000
             if reused:
                 print(f"[{index}/{len(windows)}] skip (exists) {rel}", flush=True)
                 skipped += 1
             else:
-                print(f"[{index}/{len(windows)}] {rel}", flush=True)
-                cut_clip(source, output, local_start, local_end, reencode=args.reencode)
+                print(
+                    f"[{index}/{len(windows)}] {rel} "
+                    f"(pad -{pad_lead:.1f}/+{pad_trail:.1f}s)",
+                    flush=True,
+                )
+                cut_clip(
+                    source,
+                    output,
+                    local_start,
+                    local_end,
+                    reencode=args.reencode,
+                    stream_copy=bool(args.stream_copy),
+                    accurate=bool(args.accurate),
+                )
                 cut_count += 1
                 if publish and gcs_mod is not None:
                     rel_ds = output.relative_to(dataset_dir).as_posix()
@@ -476,12 +589,18 @@ def main(argv: list[str] | None = None) -> int:
                     "end": window["end"],
                     "localStart": round(local_start, 3),
                     "localEnd": round(local_end, 3),
+                    "windowLocalStart": round(window_start, 3),
+                    "windowLocalEnd": round(window_end, 3),
+                    "padLead": pad_lead,
+                    "padTrail": pad_trail,
                     "timelineOffset": timeline_offset,
-                    "duration": round(window["end"] - window["start"], 3),
+                    "duration": round(local_end - local_start, 3),
+                    "windowDuration": round(window_end - window_start, 3),
                     "types": window.get("types") or [window["type"]],
                     "matchId": window.get("matchId"),
                     "champion": window.get("champion"),
                     "opponentChampion": window.get("opponentChampion"),
+                    "laneOpponentChampion": window.get("laneOpponentChampion"),
                     "win": window.get("win"),
                     "queueId": window.get("queueId"),
                     "teamPosition": window.get("teamPosition"),
@@ -506,6 +625,8 @@ def main(argv: list[str] | None = None) -> int:
                     "skipped_existing": skipped,
                     "dir": str(out_dir),
                     "reencode": bool(args.reencode),
+                    "accurate": bool(args.accurate),
+                    "stream_copy": bool(args.stream_copy),
                 },
                 indent=2,
             )

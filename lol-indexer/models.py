@@ -107,6 +107,7 @@ class MatchSummary:
     gameEndTimestamp: int | None = None
     participantId: int | None = None
     teamPosition: str | None = None
+    laneOpponentChampion: str | None = None
     events: list[PlayerEvent] = field(default_factory=list)
     error: str | None = None
 
@@ -132,6 +133,8 @@ class MatchSummary:
             data["participantId"] = self.participantId
         if self.teamPosition is not None:
             data["teamPosition"] = self.teamPosition
+        if self.laneOpponentChampion is not None:
+            data["laneOpponentChampion"] = self.laneOpponentChampion
         if self.error is not None:
             data["error"] = self.error
         return data

@@ -383,6 +383,22 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="After wide snap, shrink window to overlapping transcript span",
     )
+    p.add_argument(
+        "--game-end-duration",
+        type=float,
+        default=13.0,
+        help=(
+            "Standalone nexus/GAME_END clip length in seconds (default: 13). "
+            "If the last KDA falls in this window, that clip is extended instead. "
+            "Set 0 to disable."
+        ),
+    )
+    p.add_argument(
+        "--game-end-tail",
+        type=float,
+        default=5.0,
+        help="Seconds after GAME_END for explosion/banner (default: 5)",
+    )
     return p
 
 
@@ -461,6 +477,242 @@ def merge_overlapping_windows(
     return merged
 
 
+def _event_time_span(window: dict[str, Any]) -> tuple[float, float]:
+    """First/last action times inside a (possibly merged) window."""
+    times: list[float] = []
+
+    def _collect(node: dict[str, Any]) -> None:
+        t = node.get("vodOffsetSeconds")
+        if t is not None:
+            times.append(float(t))
+        for src in node.get("sources") or []:
+            if isinstance(src, dict):
+                _collect(src)
+
+    _collect(window)
+    if not times:
+        start = float(window.get("start") or 0.0)
+        end = float(window.get("end") or start)
+        mid = (start + end) / 2.0
+        return mid, mid
+    return min(times), max(times)
+
+
+def trim_window_to_max(
+    window: dict[str, Any],
+    *,
+    pre_roll: float,
+    post_roll: float,
+    max_duration: float,
+) -> dict[str, Any]:
+    """
+    Cap duration while keeping:
+      - post-roll after the LAST action
+      - pre-roll before the FIRST action (chain kills must not lose opener buffer)
+
+    Merged multi-kill clips used to re-center on the first kill's timestamp,
+    which chopped the ending right after the first kill. The later fix of
+    ``trim_keep_last_action`` then stole the first kill's lead-in whenever the
+    chain exceeded ``max_duration``. For chains we keep both anchors and allow
+    the window to exceed ``max_duration``.
+    """
+    first_t, last_t = _event_time_span(window)
+    window["firstEventOffset"] = round(first_t, 3)
+    window["lastEventOffset"] = round(last_t, 3)
+
+    start = float(window["start"])
+    end = float(window["end"])
+    ideal_start = max(0.0, first_t - pre_roll)
+    ideal_end = last_t + post_roll
+    start = min(start, ideal_start)
+    end = max(end, ideal_end)
+
+    source_count = len(window.get("sources") or [])
+    if source_count <= 1:
+        # Also count nested/types for overlap-merged windows that flattened sources.
+        source_count = max(
+            1,
+            int(window.get("source_event_count") or 0),
+            len(window.get("types") or []),
+        )
+    is_chain = source_count > 1 or (last_t - first_t) > 1.0
+
+    if end - start > max_duration:
+        # Always keep last-action post-roll + first-action pre-roll.
+        end = last_t + post_roll
+        start = max(0.0, first_t - pre_roll)
+        if end - start > max_duration and not is_chain:
+            # Single action: hard-cap by trimming lead-in only.
+            start = max(0.0, end - max_duration)
+            window["endReason"] = f"{window.get('endReason')}+trim_keep_last_action"
+            if start > last_t:
+                start = max(0.0, last_t)
+                end = start + max_duration
+        elif end - start > max_duration:
+            # Chain / multi-kill: keep both buffers; allow over max_duration.
+            window["endReason"] = f"{window.get('endReason')}+chain_keep_first_pre"
+            window["overMaxDuration"] = True
+
+    window["start"] = round(start, 3)
+    window["end"] = round(end, 3)
+    window["clipStart"] = format_hms(start)
+    window["clipEnd"] = format_hms(end)
+    return window
+
+
+def _game_end_offsets(events_payload: dict[str, Any]) -> dict[str, float]:
+    """matchId → GAME_END vodOffsetSeconds."""
+    out: dict[str, float] = {}
+    for match in events_payload.get("matches") or []:
+        mid = match.get("matchId")
+        if not mid:
+            continue
+        for event in match.get("events") or []:
+            if event.get("type") != "GAME_END":
+                continue
+            if event.get("vodOffsetSeconds") is None:
+                continue
+            out[str(mid)] = float(event["vodOffsetSeconds"])
+            break
+    return out
+
+
+def apply_game_end_bookends(
+    windows: list[dict[str, Any]],
+    events_payload: dict[str, Any],
+    *,
+    end_duration: float = 13.0,
+    end_tail: float = 5.0,
+    segments: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
+    """
+    Attach nexus / GAME_END coverage.
+
+    If the last KILL/DEATH/ASSIST for a match falls inside the end window
+    (or the last clip already overlaps it), extend that clip through
+    GAME_END + tail — no separate end segment to stitch.
+
+    Otherwise add a standalone ~end_duration GAME_END window.
+    """
+    if end_duration <= 0:
+        return windows
+
+    ends = _game_end_offsets(events_payload)
+    if not ends:
+        return windows
+
+    pre = max(0.1, float(end_duration) - float(end_tail))
+    post = max(0.0, float(end_tail))
+    segs = segments or []
+
+    by_match: dict[str, list[dict[str, Any]]] = {}
+    for w in windows:
+        mid = str(w.get("matchId") or "")
+        if mid:
+            by_match.setdefault(mid, []).append(w)
+
+    extras: list[dict[str, Any]] = []
+    for mid, game_end_t in ends.items():
+        if game_end_t < 0:
+            # Ended before VOD start — nothing to cut.
+            continue
+        end_start = max(0.0, game_end_t - pre)
+        end_end = game_end_t + post
+        match_windows = by_match.get(mid) or []
+
+        last_action: float | None = None
+        last_window: dict[str, Any] | None = None
+        for w in match_windows:
+            _first, last_t = _event_time_span(w)
+            if last_action is None or last_t >= last_action:
+                last_action = last_t
+                last_window = w
+
+        overlaps = False
+        if last_window is not None and last_action is not None:
+            # Last KDA is inside the end window, or last clip already reaches it.
+            if last_action >= end_start or float(last_window["end"]) >= end_start:
+                overlaps = True
+
+        if overlaps and last_window is not None:
+            new_end = max(float(last_window["end"]), end_end)
+            last_window["end"] = round(new_end, 3)
+            last_window["clipEnd"] = format_hms(new_end)
+            last_window["duration"] = round(new_end - float(last_window["start"]), 3)
+            types = list(last_window.get("types") or [last_window.get("type")])
+            if "GAME_END" not in types:
+                types.append("GAME_END")
+            last_window["types"] = types
+            last_window["includesGameEnd"] = True
+            last_window["gameEndOffset"] = round(game_end_t, 3)
+            last_window["endReason"] = f"{last_window.get('endReason')}+extend_to_game_end"
+            if segs:
+                last_window["transcript"] = _transcript_for_span(
+                    segs, float(last_window["start"]), new_end
+                )
+            print(
+                f"[snap] {mid}: last KDA overlaps end window — "
+                f"extend clip through GAME_END ({game_end_t:.1f}s)",
+                flush=True,
+            )
+            continue
+
+        # Standalone nexus clip (~10s by default).
+        meta = next(
+            (m for m in (events_payload.get("matches") or []) if str(m.get("matchId")) == mid),
+            {},
+        )
+        end_event = next(
+            (
+                e
+                for e in (meta.get("events") or [])
+                if e.get("type") == "GAME_END"
+            ),
+            {},
+        )
+        extras.append(
+            {
+                "type": "GAME_END",
+                "matchId": mid,
+                "champion": meta.get("champion"),
+                "win": meta.get("win"),
+                "queueId": meta.get("queueId"),
+                "teamPosition": meta.get("teamPosition"),
+                "laneOpponentChampion": meta.get("laneOpponentChampion"),
+                "opponentChampion": end_event.get("opponentChampion"),
+                "gameTime": end_event.get("gameTime"),
+                "vodTime": end_event.get("vodTime"),
+                "vodOffsetSeconds": game_end_t,
+                "firstEventOffset": round(game_end_t, 3),
+                "lastEventOffset": round(game_end_t, 3),
+                "start": round(end_start, 3),
+                "end": round(end_end, 3),
+                "clipStart": format_hms(end_start),
+                "clipEnd": format_hms(end_end),
+                "rawStart": round(end_start, 3),
+                "rawEnd": round(end_end, 3),
+                "startReason": "game_end_pre",
+                "endReason": "game_end_post",
+                "duration": round(end_end - end_start, 3),
+                "types": ["GAME_END"],
+                "includesGameEnd": True,
+                "gameEndOffset": round(game_end_t, 3),
+                "standaloneGameEnd": True,
+                "transcript": _transcript_for_span(segs, end_start, end_end) if segs else "",
+                "sources": [],
+            }
+        )
+        print(
+            f"[snap] {mid}: standalone GAME_END window "
+            f"{format_hms(end_start)}–{format_hms(end_end)} ({end_end - end_start:.1f}s)",
+            flush=True,
+        )
+
+    windows.extend(extras)
+    windows.sort(key=lambda w: float(w.get("start") or 0.0))
+    return windows
+
+
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     dataset_dir = args.dataset_dir.resolve()
@@ -514,6 +766,7 @@ def main(argv: list[str] | None = None) -> int:
                         "win": match.get("win"),
                         "queueId": match.get("queueId"),
                         "teamPosition": match.get("teamPosition"),
+                        "laneOpponentChampion": match.get("laneOpponentChampion"),
                         "opponentChampion": event.get("opponentChampion"),
                         "gameTime": event.get("gameTime"),
                         "vodTime": event.get("vodTime"),
@@ -545,17 +798,13 @@ def main(argv: list[str] | None = None) -> int:
                 )
         # After merge, recompute combined transcript span text lightly.
         for w in windows:
-            # Cap merged fights that blew past max_duration.
-            start = float(w["start"])
-            end = float(w["end"])
-            event_t = float(w.get("vodOffsetSeconds") or ((start + end) / 2.0))
-            if end - start > args.max_duration:
-                half = args.max_duration / 2.0
-                start = max(0.0, event_t - half)
-                end = start + args.max_duration
-                w["start"] = round(start, 3)
-                w["end"] = round(end, 3)
-                w["endReason"] = f"{w.get('endReason')}+trim_merged_max"
+            # Cap merged fights; always keep post-roll after the LAST action.
+            trim_window_to_max(
+                w,
+                pre_roll=args.pre_roll,
+                post_roll=args.post_roll,
+                max_duration=args.max_duration,
+            )
             w["duration"] = round(float(w["end"]) - float(w["start"]), 3)
             w["types"] = list(dict.fromkeys(w.get("types") or [w["type"]]))
             w["clipStart"] = format_hms(float(w["start"]))
@@ -564,6 +813,18 @@ def main(argv: list[str] | None = None) -> int:
             w["transcript"] = _transcript_for_span(
                 segments, float(w["start"]), float(w["end"])
             )
+
+        windows = apply_game_end_bookends(
+            windows,
+            events_payload,
+            end_duration=float(args.game_end_duration),
+            end_tail=float(args.game_end_tail),
+            segments=segments,
+        )
+        for w in windows:
+            w["duration"] = round(float(w["end"]) - float(w["start"]), 3)
+            w["clipStart"] = format_hms(float(w["start"]))
+            w["clipEnd"] = format_hms(float(w["end"]))
 
         out = {
             "schema_version": 1,
@@ -581,6 +842,8 @@ def main(argv: list[str] | None = None) -> int:
             "overlap_slack": args.overlap_slack,
             "center_on_event": bool(args.center_on_event),
             "speech_nudge": args.speech_nudge if args.center_on_event else None,
+            "game_end_duration": args.game_end_duration,
+            "game_end_tail": args.game_end_tail,
             "window_count": len(windows),
             "windows": windows,
         }

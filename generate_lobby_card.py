@@ -29,6 +29,26 @@ ROLE_LABELS = {
     "BOTTOM": "bot",
     "UTILITY": "support",
 }
+ROLE_ABBREV = {
+    "TOP": "TOP",
+    "JUNGLE": "JG",
+    "MIDDLE": "MID",
+    "BOTTOM": "BOT",
+    "UTILITY": "SUP",
+}
+TIER_SHORT = {
+    "IRON": "IRON",
+    "BRONZE": "BRONZE",
+    "SILVER": "SILVER",
+    "GOLD": "GOLD",
+    "PLATINUM": "PLAT",
+    "EMERALD": "EMERALD",
+    "DIAMOND": "DIA",
+    "MASTER": "M",
+    "GRANDMASTER": "GM",
+    "CHALLENGER": "CHALL",
+    "UNRANKED": "UNRANKED",
+}
 
 TIER_COLORS: dict[str, tuple[int, int, int]] = {
     "IRON": (110, 110, 120),
@@ -263,27 +283,271 @@ def fit_text(
     return out, font
 
 
-def display_name(player: dict[str, Any], max_width: int, draw, font_path: str):
+def player_riot_id(player: dict[str, Any]) -> str:
+    game = str(player.get("name") or "?").strip() or "?"
+    tag = str(player.get("tag") or "").strip()
+    return f"{game}#{tag}" if tag else game
+
+
+def ellipsize_text(draw, text: str, font, max_width: int) -> str:
+    def width(s: str) -> int:
+        bbox = draw.textbbox((0, 0), s, font=font)
+        return bbox[2] - bbox[0]
+
+    if width(text) <= max_width:
+        return text
+    out = text
+    while out and width(out + "…") > max_width:
+        out = out[:-1]
+    return (out.rstrip() + "…") if out else "…"
+
+
+def names_for_lobby(
+    placed: dict[str, Any],
+    draw,
+    font_path: str,
+    card_w: int,
+    gap: int,
+):
+    """One font sized so MY name always fits; everyone else ellipsizes to that width.
+
+    Max width is my rendered name (capped to the card plus a little gutter). Mine
+    is never truncated. Gold for me, bright white for others.
     """
-    Prefer name#tag. If too long even at small size, drop tag then ellipsize game name.
-    """
-    game = str(player.get("name") or "?")
-    tag = str(player.get("tag") or "")
-    full = f"{game}#{tag}" if tag else game
-    text, font = fit_text(draw, full, max_width=max_width, font_path=font_path, start_size=18)
-    # If we had to heavily shrink/ellipsize a long tagline name, try game name alone
-    if tag and ("…" in text or len(full) > 22):
-        game_only, font2 = fit_text(
-            draw, game, max_width=max_width, font_path=font_path, start_size=18
-        )
-        # Prefer readable game name over mangled full riot id when both truncate
-        if "…" not in game_only or len(game_only) >= len(text) - 2:
-            return game_only, font2
-    return text, font
+    from PIL import ImageFont
+
+    max_slot = card_w + max(0, gap - 10)
+    me = placed.get("me") or {}
+    me_full = player_riot_id(me) if me else ""
+    me_game = str(me.get("name") or "").strip() if me else ""
+    chosen = None
+    me_text = me_full or me_game
+    me_w = max_slot
+    for size in range(26, 15, -1):
+        try:
+            fnt = ImageFont.truetype(font_path, size)
+        except OSError:
+            fnt = ImageFont.load_default()
+            chosen = fnt
+            break
+        hit = False
+        for candidate in (me_full, me_game):
+            if not candidate:
+                continue
+            bbox = draw.textbbox((0, 0), candidate, font=fnt)
+            if bbox[2] - bbox[0] <= max_slot:
+                chosen = fnt
+                me_text = candidate
+                me_w = bbox[2] - bbox[0]
+                hit = True
+                break
+        if hit:
+            break
+    if chosen is None:
+        try:
+            chosen = ImageFont.truetype(font_path, 16)
+        except OSError:
+            chosen = ImageFont.load_default()
+        if me_text:
+            bbox = draw.textbbox((0, 0), me_text, font=chosen)
+            me_w = min(max_slot, bbox[2] - bbox[0])
+    return chosen, me_text, me_w
 
 
 def role_label(position: str) -> str:
     return ROLE_LABELS.get(str(position or "").upper(), str(position or ""))
+
+
+def role_abbrev(position: str) -> str:
+    pos = str(position or "").upper()
+    return ROLE_ABBREV.get(pos, pos[:3] or "?")
+
+
+def is_me_player(player: dict[str, Any], highlight_name: str | None) -> bool:
+    hl = (highlight_name or "").strip().lower()
+    if not hl:
+        return False
+    name = str(player.get("name") or "").lower()
+    tag = str(player.get("tag") or "").lower()
+    full = f"{name}#{tag}" if tag else name
+    if hl == full or hl == name:
+        return True
+    if "#" in hl:
+        g, t = hl.split("#", 1)
+        return name == g and (not t or tag == t)
+    return name == hl or hl.endswith(name)
+
+
+def lobby_layout(width: int = 1920, height: int = 1080) -> dict[str, int]:
+    """Card geometry for the 5-v-5 landscape lobby (blue on top, red on bottom)."""
+    card_w, card_h = 168, 300
+    gap = 28
+    row_width = 5 * card_w + 4 * gap
+    x0 = (width - row_width) // 2
+    name_block = 62
+    role_pad = 28
+    vs_band = 120
+    blue_y = 40 + role_pad
+    red_y = blue_y + card_h + name_block + vs_band
+    if red_y + card_h + name_block > height - 20:
+        overflow = (red_y + card_h + name_block) - (height - 20)
+        card_h = max(240, card_h - overflow)
+        red_y = blue_y + card_h + name_block + vs_band
+    vs_y = blue_y + card_h + name_block + 18
+    return {
+        "width": width,
+        "height": height,
+        "card_w": card_w,
+        "card_h": card_h,
+        "gap": gap,
+        "row_width": row_width,
+        "x0": x0,
+        "name_block": name_block,
+        "role_pad": role_pad,
+        "vs_band": vs_band,
+        "blue_y": blue_y,
+        "red_y": red_y,
+        "vs_y": vs_y,
+    }
+
+
+def stamp_on_layout(
+    player: dict[str, Any] | None, layout: dict[str, int]
+) -> dict[str, Any] | None:
+    """Recompute card x/y/w/h from col/row for this image size."""
+    if not player:
+        return None
+    p = dict(player)
+    if p.get("col") is None or not p.get("row"):
+        return p
+    col = int(p["col"])
+    row = str(p["row"])
+    step = layout["card_w"] + layout["gap"]
+    p["x"] = layout["x0"] + col * step
+    p["y"] = layout["blue_y"] if row == "blue" else layout["red_y"]
+    p["w"] = layout["card_w"]
+    p["h"] = layout["card_h"]
+    return p
+
+
+def lobby_content_box(layout: dict[str, int]) -> tuple[int, int, int, int]:
+    """Centered crop that keeps all 10 cards + rank wings."""
+    pad = 44  # wings ~29px + frame
+    x = max(0, layout["x0"] - pad)
+    w = min(layout["width"] - x, layout["row_width"] + 2 * pad)
+    return x, 0, w, layout["height"]
+
+
+def place_players(
+    rows: list[dict[str, Any]],
+    *,
+    highlight_name: str | None = None,
+    width: int = 1920,
+    height: int = 1080,
+) -> dict[str, Any]:
+    layout = lobby_layout(width, height)
+    blue = sort_by_role([r for r in rows if int(r.get("teamId") or 0) == 100])
+    red = sort_by_role([r for r in rows if int(r.get("teamId") or 0) == 200])
+    placed: list[dict[str, Any]] = []
+    step = layout["card_w"] + layout["gap"]
+
+    def stamp(player: dict[str, Any], col: int, row: str, y: int) -> dict[str, Any]:
+        item = dict(player)
+        item.update(
+            {
+                "col": col,
+                "row": row,
+                "x": layout["x0"] + col * step,
+                "y": y,
+                "w": layout["card_w"],
+                "h": layout["card_h"],
+                "mine": is_me_player(player, highlight_name),
+            }
+        )
+        return item
+
+    for i, player in enumerate(blue):
+        placed.append(stamp(player, i, "blue", layout["blue_y"]))
+    for i, player in enumerate(red):
+        placed.append(stamp(player, i, "red", layout["red_y"]))
+
+    me = next((p for p in placed if p.get("mine")), None)
+    opponent = None
+    if me is not None:
+        opponent = next(
+            (
+                p
+                for p in placed
+                if p.get("row") != me.get("row") and p.get("col") == me.get("col")
+            ),
+            None,
+        )
+    cx, cy, cw, ch = lobby_content_box(layout)
+    return {
+        "layout": layout,
+        "players": placed,
+        "me": me,
+        "opponent": opponent,
+        "contentBox": {"x": cx, "y": cy, "w": cw, "h": ch},
+        "highlight": highlight_name,
+    }
+
+
+def player_focus_box(player: dict[str, Any], layout: dict[str, int], pad: int = 24) -> tuple[int, int, int, int]:
+    """Card plus role label above and name/rank below."""
+    x = int(player["x"]) - pad
+    y = int(player["y"]) - int(layout["role_pad"])
+    w = int(player["w"]) + 2 * pad
+    h = int(player["h"]) + int(layout["role_pad"]) + int(layout["name_block"])
+    return x, y, w, h
+
+
+def lobby_hook(placed: dict[str, Any]) -> dict[str, Any]:
+    """Three readable lines for a 9:16 intro — everything else is visual context."""
+    me = placed.get("me") or {}
+    opp = placed.get("opponent") or {}
+    players = list(placed.get("players") or [])
+    me_champ = str(me.get("champion") or "UNKNOWN").upper()
+    me_role = role_abbrev(str(me.get("position") or ""))
+    me_tier = str(me.get("tier") or "UNRANKED").upper()
+    me_lp = me.get("lp")
+    opp_champ = str(opp.get("champion") or "").upper()
+    opp_lp = opp.get("lp")
+    opp_tier = str(opp.get("tier") or "").upper()
+
+    lps = [int(p["lp"]) for p in players if p.get("lp") is not None]
+    avg_lp = int(round(sum(lps) / len(lps))) if len(lps) >= 8 else None
+    tiers = [str(p.get("tier") or "").upper() for p in players]
+    lobby_tier = "UNRANKED"
+    for t in ("CHALLENGER", "GRANDMASTER", "MASTER", "DIAMOND", "EMERALD", "PLATINUM"):
+        if t in tiers:
+            lobby_tier = t
+            break
+
+    me_lp_s = f"{int(me_lp)} LP" if me_lp is not None else ""
+    opp_lp_s = f"{int(opp_lp)} LP" if opp_lp is not None else ""
+    me_short = TIER_SHORT.get(me_tier, me_tier)
+    return {
+        "meChampion": me_champ,
+        "meRole": me_role,
+        "meTier": me_tier,
+        "meLp": me_lp,
+        "oppChampion": opp_champ,
+        "oppTier": opp_tier,
+        "oppLp": opp_lp,
+        "avgLp": avg_lp,
+        "lobbyTier": lobby_tier,
+        "lobbyTitle": f"{lobby_tier} LOBBY",
+        "hookMe": " ".join(p for p in [me_champ, me_role] if p).strip(),
+        "hookLp": me_lp_s,
+        "hookRank": f"{me_short} {me_lp_s}".strip() if me_lp_s else me_short,
+        "hookVs": (
+            f"{me_lp_s} {me_champ} {me_role}  vs  {opp_lp_s} {opp_champ}".strip()
+            if opp_champ
+            else f"{me_lp_s} {me_champ} {me_role}".strip()
+        ),
+        "hookAvg": f"AVG LOBBY: ~{avg_lp} LP" if avg_lp is not None else "",
+    }
 
 
 def render_lobby_card(
@@ -321,47 +585,25 @@ def render_lobby_card(
         font_vs = ImageFont.load_default()
         font_role = font_vs
 
-    blue = sort_by_role([r for r in rows if r["teamId"] == 100])
-    red = sort_by_role([r for r in rows if r["teamId"] == 200])
+    placed = place_players(rows, highlight_name=highlight_name, width=width, height=height)
+    layout = placed["layout"]
+    card_w = layout["card_w"]
+    card_h = layout["card_h"]
+    x0 = layout["x0"]
+    row_width = layout["row_width"]
+    vs_y = layout["vs_y"]
 
-    hl = (highlight_name or "").strip().lower()
-
-    def is_me(player: dict[str, Any]) -> bool:
-        if not hl:
-            return False
-        name = str(player.get("name") or "").lower()
-        tag = str(player.get("tag") or "").lower()
-        full = f"{name}#{tag}" if tag else name
-        if hl == full or hl == name:
-            return True
-        # RIOT_ID may be "twtv lolAmbrosek#twtv"
-        if "#" in hl:
-            g, t = hl.split("#", 1)
-            return name == g and (not t or tag == t)
-        return name == hl or hl.endswith(name)
-
-    # Portrait geometry — blue row on top, red row on bottom
-    card_w, card_h = 168, 300
-    gap = 28
-    row_width = 5 * card_w + 4 * gap
-    x0 = (width - row_width) // 2
-    name_block = 54
-    role_pad = 28  # space above card for role label
-    vs_band = 120  # padding between blue names and red role labels
-    blue_y = 40 + role_pad
-    red_y = blue_y + card_h + name_block + vs_band
-    if red_y + card_h + name_block > height - 20:
-        overflow = (red_y + card_h + name_block) - (height - 20)
-        card_h = max(240, card_h - overflow)
-        red_y = blue_y + card_h + name_block + vs_band
-
-    # VS sits in the upper part of the band so more padding sits above the bottom row
-    vs_y = blue_y + card_h + name_block + 18
     vb = draw.textbbox((0, 0), "VS", font=font_vs)
     draw.text(((width - (vb[2] - vb[0])) // 2, vs_y), "VS", fill=(230, 230, 240, 230), font=font_vs)
     mid_y = vs_y + (vb[3] - vb[1]) // 2
     draw.line([(x0, mid_y), (width // 2 - 50, mid_y)], fill=(255, 255, 255, 40), width=2)
     draw.line([(width // 2 + 50, mid_y), (x0 + row_width, mid_y)], fill=(255, 255, 255, 40), width=2)
+
+    name_font, me_name, me_name_w = names_for_lobby(
+        placed, draw, font_path_bold, card_w, layout["gap"]
+    )
+    gold = (255, 214, 90, 255)
+    bright = (255, 255, 255, 255)
 
     def render_player(
         player: dict[str, Any],
@@ -424,12 +666,22 @@ def render_lobby_card(
             pw = pb[2] - pb[0]
             frame.text((ox + (cw - pw) // 2, oy - 22), pos, fill=accent + (220,), font=font_role)
 
-        # Name under card — highlight mine with gold text only
-        name, name_font = display_name(player, max_width=cw - 8, draw=frame, font_path=font_path_bold)
+        # Name under card — sized so mine always fits; others ellipsize to that width.
+        if mine and me_name:
+            name = me_name
+        else:
+            raw = player_riot_id(player)
+            cap = len(me_name) if me_name else len(raw)
+            if me_name and len(raw) > cap:
+                raw = raw[: max(1, cap - 1)] + "…"
+            name = ellipsize_text(frame, raw, name_font, me_name_w)
         nb = frame.textbbox((0, 0), name, font=name_font)
         nw = nb[2] - nb[0]
-        name_fill = (255, 220, 110, 255) if mine else (235, 235, 240, 255)
-        frame.text((ox + (cw - nw) // 2, oy + ch + 10), name, fill=name_fill, font=name_font)
+        nx = ox + (cw - nw) // 2
+        ny = oy + ch + 8
+        name_fill = gold if mine else bright
+        frame.text((nx + 1, ny + 1), name, fill=(0, 0, 0, 220), font=name_font)
+        frame.text((nx, ny), name, fill=name_fill, font=name_font)
 
         rank_label = str(player.get("rankLabel") or "")
         if rank_label:
@@ -445,31 +697,44 @@ def render_lobby_card(
             rw = rb[2] - rb[0]
             color = TIER_COLORS.get(tier, TIER_COLORS["UNRANKED"])
             frame.text(
-                (ox + (cw - rw) // 2, oy + ch + 32),
+                (ox + (cw - rw) // 2, oy + ch + 36),
                 rank_text,
                 fill=color + (255,),
                 font=rank_font,
             )
 
-    for i, player in enumerate(blue):
+    for player in placed["players"]:
+        accent = (70, 140, 255) if player.get("row") == "blue" else (230, 80, 80)
         render_player(
             player,
-            x0 + i * (card_w + gap),
-            blue_y,
-            (70, 140, 255),
-            mine=is_me(player),
-        )
-    for i, player in enumerate(red):
-        render_player(
-            player,
-            x0 + i * (card_w + gap),
-            red_y,
-            (230, 80, 80),
-            mine=is_me(player),
+            int(player["x"]),
+            int(player["y"]),
+            accent,
+            mine=bool(player.get("mine")),
         )
 
     output.parent.mkdir(parents=True, exist_ok=True)
     canvas.convert("RGB").save(output, format="PNG", optimize=True)
+    meta_path = output.with_name(output.stem + "_meta.json")
+    hook = lobby_hook(placed)
+    meta_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "highlight": highlight_name,
+                "layout": placed["layout"],
+                "contentBox": placed["contentBox"],
+                "me": placed.get("me"),
+                "opponent": placed.get("opponent"),
+                "players": placed["players"],
+                "hook": hook,
+            },
+            indent=2,
+            ensure_ascii=False,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     return output
 
 

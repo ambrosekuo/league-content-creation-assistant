@@ -470,6 +470,94 @@ def restore_cut_run_progress(vod_id: str, dataset_dir: Path) -> str | None:
     return subdir
 
 
+def restore_compilations_prefix(vod_id: str, dataset_dir: Path) -> Path:
+    """Download lol_compilations/ for portrait post-processing. No source.mp4."""
+    vid = vod_id.strip().lstrip("v")
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    day = resolve_day_key(vid, dataset_dir)
+    base = vod_prefix(vid, day_key=day)
+    remote = f"{base}/lol_compilations/"
+    local = dataset_dir / "lol_compilations"
+    files = download_prefix(remote, local)
+    if not files:
+        raise FileNotFoundError(f"No compilations under gs://{bucket_name()}/{remote}")
+    for name in ("metadata.json", "archive_manifest.json", "compilations.json"):
+        dest = dataset_dir / name
+        if dest.is_file():
+            continue
+        # compilations.json may live under lol_compilations/
+        if name == "compilations.json":
+            continue
+        remote_obj = f"{base}/{name}"
+        if blob_exists(remote_obj):
+            download_file(remote_obj, dest)
+    return local
+
+
+def upload_portrait_artifacts(
+    dataset_dir: Path,
+    *,
+    vod_id: str | None = None,
+    clear_remote: bool = True,
+) -> dict[str, str]:
+    """Upload lol_compilations_portrait/ only."""
+    dataset_dir = dataset_dir.resolve()
+    vid = (vod_id or dataset_dir.name).strip().lstrip("v")
+    day = resolve_day_key(vid, dataset_dir)
+    base = vod_prefix(vid, day_key=day)
+    uploaded: dict[str, str] = {}
+
+    portrait_dir = dataset_dir / "lol_compilations_portrait"
+    if not portrait_dir.is_dir():
+        return uploaded
+
+    remote_prefix = f"{base}/lol_compilations_portrait/"
+    if clear_remote:
+        removed = delete_prefix(remote_prefix)
+        if removed:
+            print(f"[upload] cleared {removed} old object(s) under {remote_prefix}", flush=True)
+
+    for path in sorted(p for p in portrait_dir.rglob("*") if p.is_file()):
+        uploaded.update(
+            upload_portrait_paths(dataset_dir, [path], vod_id=vid, day_key=day)
+        )
+    return uploaded
+
+
+def upload_portrait_paths(
+    dataset_dir: Path,
+    paths: list[Path],
+    *,
+    vod_id: str | None = None,
+    day_key: str | None = None,
+) -> dict[str, str]:
+    """Upload specific portrait files (no remote clear). For incremental publish."""
+    dataset_dir = dataset_dir.resolve()
+    vid = (vod_id or dataset_dir.name).strip().lstrip("v")
+    day = day_key or resolve_day_key(vid, dataset_dir)
+    base = vod_prefix(vid, day_key=day)
+    uploaded: dict[str, str] = {}
+    for path in paths:
+        path = path.resolve()
+        if not path.is_file():
+            continue
+        try:
+            rel = path.relative_to(dataset_dir).as_posix()
+        except ValueError:
+            rel = f"lol_compilations_portrait/{path.name}"
+        object_name = f"{base}/{rel}"
+        content_type = "application/json" if path.suffix.lower() == ".json" else None
+        if path.suffix.lower() == ".mp4":
+            content_type = "video/mp4"
+        elif path.suffix.lower() in {".jpg", ".jpeg"}:
+            content_type = "image/jpeg"
+        elif path.suffix.lower() == ".png":
+            content_type = "image/png"
+        print(f"[publish] gs://{bucket_name()}/{object_name}", flush=True)
+        uploaded[rel] = upload_file(path, object_name, content_type=content_type)
+    return uploaded
+
+
 def upload_compilation_artifacts(dataset_dir: Path, *, vod_id: str | None = None) -> dict[str, str]:
     """Upload lol_compilations/ only (does not touch lol_clips/ or source)."""
     dataset_dir = dataset_dir.resolve()
