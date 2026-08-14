@@ -16,7 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from clip_edge_pad import PAD_LEAD_S, PAD_TRAIL_S
+from clip_edge_pad import PAD_LEAD_S, PAD_TRAIL_S, detect_edge_freezes
 
 ROOT = Path(__file__).resolve().parent
 
@@ -251,10 +251,14 @@ def still_to_video(
             f"{seconds:.3f}",
             "-c:v",
             "libx264",
+            "-preset",
+            "ultrafast",
             "-tune",
             "stillimage",
             "-pix_fmt",
             "yuv420p",
+            "-threads",
+            "0",
             "-c:a",
             "aac",
             "-ar",
@@ -276,17 +280,78 @@ def still_to_video(
 
 def generate_lobby_png(match_id: str, output: Path) -> Path:
     output.parent.mkdir(parents=True, exist_ok=True)
-    run(
-        [
-            sys.executable,
-            str(ROOT / "generate_lobby_card.py"),
-            "--match-id",
-            match_id,
-            "--output",
-            str(output),
-        ]
-    )
+    cmd = [
+        sys.executable,
+        str(ROOT / "generate_lobby_card.py"),
+        "--match-id",
+        match_id,
+        "--output",
+        str(output),
+    ]
+    highlight = (os.environ.get("RIOT_ID") or "").strip().strip('"')
+    if highlight:
+        cmd.extend(["--highlight", highlight])
+    run(cmd)
     return output
+
+
+def copy_trim_clip(
+    src: Path,
+    dst: Path,
+    lead: float,
+    trail: float,
+    duration: float,
+) -> None:
+    """Drop start/end packets with -c copy (no encoder).
+
+    ``-ss`` must be before ``-i`` so the copy starts on a keyframe. Output-side
+    ``-ss`` keeps the previous GOP, which is the freeze we are trying to drop.
+    """
+    lead = max(0.0, float(lead))
+    trail = max(0.0, float(trail))
+    dur = max(0.0, float(duration))
+    keep = dur - lead - trail if dur > 0 else 0.0
+    if keep < 0.1:
+        keep = max(0.1, dur - lead) if dur > 0 else 0.1
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    # Nudge past the first video PTS so input-seek does not snap *before* it
+    # and keep the empty lead-in.
+    seek = lead + 0.02 if lead > 0 else 0.0
+    cmd: list[str] = ["ffmpeg", "-y"]
+    if seek > 0:
+        cmd += ["-ss", f"{seek:.3f}"]
+    cmd += [
+        "-i",
+        str(src),
+        "-t",
+        f"{keep:.3f}",
+        "-c",
+        "copy",
+        "-avoid_negative_ts",
+        "make_zero",
+        str(dst),
+    ]
+    run(cmd)
+
+
+def _x264_superfast_args(output: Path) -> list[str]:
+    return [
+        "-c:v",
+        "libx264",
+        "-preset",
+        "superfast",
+        "-crf",
+        "20",
+        "-threads",
+        "0",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "160k",
+        "-movflags",
+        "+faststart",
+        str(output),
+    ]
 
 
 def stitch_one(
@@ -299,38 +364,61 @@ def stitch_one(
     fps: float | None = None,
     trim_lead: float = 0.0,
     trim_trail: float = 0.0,
+    detect_freeze: bool = True,
 ) -> dict[str, Any]:
     """
-    Concatenate clips. When reencode=True (required for lobby intros), use
-    filter_complex concat so video/audio stay aligned — concat demuxer often
-    leaves the still lobby on screen while the next clip's audio starts.
+    Concatenate clips. Default is stream-copy (no encoder): freeze-detect,
+    ``-c copy`` trim each gameplay clip, concat demuxer copy. Lobby is a PNG
+    sidecar only. ``reencode=True`` uses filter_complex concat.
 
-    ``trim_lead`` / ``trim_trail`` drop the first/last N seconds of each
-    non-lobby clip (skips frozen open/close frames from seek-based cuts).
-    Cut pads by the same amounts so snap pre/post-roll is preserved.
+    ``detect_freeze`` (default) drops frozen open/close frames per gameplay
+    clip. ``trim_lead`` / ``trim_trail`` are a fixed fallback when detection
+    is off. Lobby intro is never trimmed.
     """
     output.parent.mkdir(parents=True, exist_ok=True)
     lead = max(0.0, float(trim_lead))
     trail = max(0.0, float(trim_trail))
+    freeze_trims: list[dict[str, Any]] = []
+    trim_cache: dict[str, tuple[float, float]] = {}
 
-    if reencode:
-        probe = probe_video(clips[0])
+    def clip_trims(clip: Path) -> tuple[float, float]:
+        key = str(clip)
+        if key in trim_cache:
+            return trim_cache[key]
+        is_lobby = "lobby" in clip.name.lower()
+        if is_lobby:
+            trim_cache[key] = (0.0, 0.0)
+            return 0.0, 0.0
+        if detect_freeze:
+            dur = float(probe_video(clip).get("duration") or 0.0)
+            fl, ft = detect_edge_freezes(clip, duration=dur)
+            freeze_trims.append(
+                {"clip": clip.name, "lead": fl, "trail": ft, "duration": round(dur, 3)}
+            )
+            if fl > 0 or ft > 0:
+                print(
+                    f"[freeze] {clip.name}  cut start {fl:.2f}s  end {ft:.2f}s",
+                    flush=True,
+                )
+            trim_cache[key] = (fl, ft)
+            return fl, ft
+        trim_cache[key] = (lead, trail)
+        return lead, trail
+
+    def filter_concat(src_clips: list[Path], *, already_trimmed: bool = False) -> None:
+        probe = probe_video(src_clips[0])
         w = int(width or probe["width"])
         h = int(height or probe["height"])
         rate = float(fps or probe["fps"])
         w -= w % 2
         h -= h % 2
         rate = max(1.0, min(rate, 60.0))
-
         cmd: list[str] = ["ffmpeg", "-y"]
-        for clip in clips:
+        for clip in src_clips:
             cmd.extend(["-i", str(clip)])
-
         filter_parts: list[str] = []
-        for i, clip in enumerate(clips):
-            is_lobby = "lobby" in clip.name.lower()
-            clip_lead = 0.0 if is_lobby else lead
-            clip_trail = 0.0 if is_lobby else trail
+        for i, clip in enumerate(src_clips):
+            clip_lead, clip_trail = (0.0, 0.0) if already_trimmed else clip_trims(clip)
             if clip_lead > 0 or clip_trail > 0:
                 dur = float(probe_video(clip).get("duration") or 0.0)
                 end = dur - clip_trail if (clip_trail > 0 and dur > 0) else 0.0
@@ -360,10 +448,10 @@ def stitch_one(
                 f"[{i}:a]{a_head}"
                 f"aformat=sample_rates=48000:channel_layouts=stereo[a{i}];"
             )
-        concat_in = "".join(f"[v{i}][a{i}]" for i in range(len(clips)))
+        concat_in = "".join(f"[v{i}][a{i}]" for i in range(len(src_clips)))
         filter_complex = (
             "".join(filter_parts)
-            + f"{concat_in}concat=n={len(clips)}:v=1:a=1[v][a]"
+            + f"{concat_in}concat=n={len(src_clips)}:v=1:a=1[v][a]"
         )
         cmd.extend(
             [
@@ -373,83 +461,63 @@ def stitch_one(
                 "[v]",
                 "-map",
                 "[a]",
-                "-c:v",
-                "libx264",
-                "-preset",
-                "veryfast",
-                "-crf",
-                "20",
-                "-c:a",
-                "aac",
-                "-b:a",
-                "160k",
-                "-movflags",
-                "+faststart",
-                str(output),
+                *_x264_superfast_args(output),
             ]
         )
         run(cmd)
-        mode = "filter_concat"
-        if lead > 0 or trail > 0:
-            mode = f"filter_concat_trim_lead_{lead:.2f}s_trail_{trail:.2f}s"
-    else:
+
+    def concat_copy(src_clips: list[Path]) -> None:
         list_path = output.with_suffix(".concat.txt")
         lines = []
-        for clip in clips:
+        for clip in src_clips:
             escaped = str(clip.resolve()).replace("'", r"'\''")
             lines.append(f"file '{escaped}'")
         list_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
         try:
-            try:
-                run(
-                    [
-                        "ffmpeg",
-                        "-y",
-                        "-f",
-                        "concat",
-                        "-safe",
-                        "0",
-                        "-i",
-                        str(list_path),
-                        "-c",
-                        "copy",
-                        "-movflags",
-                        "+faststart",
-                        str(output),
-                    ]
-                )
-                mode = "copy"
-            except RuntimeError:
-                run(
-                    [
-                        "ffmpeg",
-                        "-y",
-                        "-f",
-                        "concat",
-                        "-safe",
-                        "0",
-                        "-i",
-                        str(list_path),
-                        "-c:v",
-                        "libx264",
-                        "-preset",
-                        "veryfast",
-                        "-crf",
-                        "20",
-                        "-c:a",
-                        "aac",
-                        "-b:a",
-                        "160k",
-                        "-movflags",
-                        "+faststart",
-                        str(output),
-                    ]
-                )
-                mode = "reencode_fallback"
+            run(
+                [
+                    "ffmpeg",
+                    "-y",
+                    "-f",
+                    "concat",
+                    "-safe",
+                    "0",
+                    "-i",
+                    str(list_path),
+                    "-c",
+                    "copy",
+                    "-movflags",
+                    "+faststart",
+                    str(output),
+                ]
+            )
         finally:
             list_path.unlink(missing_ok=True)
 
-    return {
+    if reencode:
+        filter_concat(clips)
+        mode = "filter_concat"
+        if detect_freeze:
+            mode = "filter_concat_freeze_detect"
+        elif lead > 0 or trail > 0:
+            mode = f"filter_concat_trim_lead_{lead:.2f}s_trail_{trail:.2f}s"
+    else:
+        with tempfile.TemporaryDirectory(prefix="stitch_trim_") as tmp:
+            tmp_dir = Path(tmp)
+            work: list[Path] = []
+            for i, clip in enumerate(clips):
+                clip_lead, clip_trail = clip_trims(clip)
+                if clip_lead <= 0 and clip_trail <= 0:
+                    work.append(clip)
+                    continue
+                dur = float(probe_video(clip).get("duration") or 0.0)
+                dest = tmp_dir / f"{i:02d}_{clip.name}"
+                copy_trim_clip(clip, dest, clip_lead, clip_trail, dur)
+                work.append(dest)
+            concat_copy(work)
+            mode = "copy_trim" if detect_freeze else "copy"
+
+    result = {
         "output": str(output),
         "filename": output.name,
         "clipCount": len(clips),
@@ -457,6 +525,9 @@ def stitch_one(
         "bytes": output.stat().st_size if output.is_file() else 0,
         "mode": mode,
     }
+    if freeze_trims:
+        result["freezeTrims"] = freeze_trims
+    return result
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -479,7 +550,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--reencode",
         action="store_true",
-        help="Always re-encode (slower). Default tries stream copy first.",
+        help="Always re-encode via filter concat (slower). Default is copy-trim + stream copy.",
     )
     p.add_argument(
         "--min-clips",
@@ -500,13 +571,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip lobby card intro even if --lobby-seconds > 0",
     )
     p.add_argument(
+        "--detect-freeze",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Detect and drop frozen frames at the start/end of each gameplay "
+        "clip (default: on). Lobby intro is never trimmed.",
+    )
+    p.add_argument(
         "--trim-lead",
         type=float,
         default=PAD_LEAD_S,
         help=(
-            f"Seconds to drop from the start of each gameplay clip when "
-            f"re-encoding/stitching (default: {PAD_LEAD_S}). Must match cut "
-            f"--pad-lead. Lobby intro is never trimmed. Use 0 to disable."
+            f"Fixed seconds to drop from the start of each gameplay clip when "
+            f"--no-detect-freeze (default: {PAD_LEAD_S}). Must match cut "
+            f"--pad-lead. Use 0 to disable."
         ),
     )
     p.add_argument(
@@ -514,9 +592,9 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=PAD_TRAIL_S,
         help=(
-            f"Seconds to drop from the end of each gameplay clip when "
-            f"re-encoding/stitching (default: {PAD_TRAIL_S}). Must match cut "
-            f"--pad-trail. Lobby intro is never trimmed. Use 0 to disable."
+            f"Fixed seconds to drop from the end of each gameplay clip when "
+            f"--no-detect-freeze (default: {PAD_TRAIL_S}). Must match cut "
+            f"--pad-trail. Use 0 to disable."
         ),
     )
     return p
@@ -602,27 +680,14 @@ def main(argv: list[str] | None = None) -> int:
                     lobby_png = out_dir / f"{Path(weave_name).stem}_lobby.png"
                     print(f"[lobby] {folder} match={match_id}", flush=True)
                     generate_lobby_png(match_id, lobby_png)
-                    with tempfile.TemporaryDirectory(prefix=f"lobby_{folder}_") as tmp:
-                        lobby_mp4 = Path(tmp) / "00_lobby.mp4"
-                        still_to_video(
-                            lobby_png,
-                            lobby_mp4,
-                            seconds=float(args.lobby_seconds),
-                            width=int(probe["width"]),
-                            height=int(probe["height"]),
-                            fps=float(probe["fps"]),
-                        )
-                        durable = out_dir / f"{Path(weave_name).stem}_lobby_intro.mp4"
-                        durable.write_bytes(lobby_mp4.read_bytes())
-                        stitch_clips = [durable] + stitch_clips
+                    # PNG only — no lobby mp4 encode. Portrait builds the 3s intro.
+                    stitch_clips = list(clips)
                     lobby_meta = {
                         "included": True,
                         "matchId": match_id,
                         "seconds": float(args.lobby_seconds),
                         "png": lobby_png.name,
-                        "intro": durable.name,
                     }
-                    force_reencode = True  # lobby + gameplay need synced filter concat
                 except Exception as exc:
                     print(f"[lobby] failed {folder}: {exc}", flush=True)
                     lobby_meta = {"included": False, "error": str(exc)}
@@ -637,6 +702,7 @@ def main(argv: list[str] | None = None) -> int:
             fps=float(probe["fps"]),
             trim_lead=float(args.trim_lead),
             trim_trail=float(args.trim_trail),
+            detect_freeze=bool(args.detect_freeze),
         )
         info["gameFolder"] = folder
         info["filename"] = output.name
@@ -654,6 +720,7 @@ def main(argv: list[str] | None = None) -> int:
         "lobby_seconds": float(args.lobby_seconds) if want_lobby else 0,
         "trim_lead": float(args.trim_lead),
         "trim_trail": float(args.trim_trail),
+        "detect_freeze": bool(args.detect_freeze),
         "game_count": len(weaves),
         "weaves": weaves,
     }

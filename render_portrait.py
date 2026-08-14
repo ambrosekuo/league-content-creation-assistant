@@ -14,7 +14,7 @@ Calibrate --cam-* / --kda-* once from a mid-frame; both are assumed static.
 
 For weaves with a lobby-card intro, pass --still-seconds 3 so the opening
 is shown without the facecam split. Default --still-mode story plays the
-animated lobby intro (full lobby → you → matchup) then smash-cuts to gameplay.
+animated lobby intro (full lobby → you vs lane opponent) then smash-cuts to gameplay.
 """
 
 from __future__ import annotations
@@ -142,14 +142,26 @@ def _prepare_story_intro(
         png = output.with_name(f"{source.stem}_lobby_frame.png")
         extract_lobby_png(source, png, at=min(0.8, max(0.2, still_seconds * 0.35)))
         print(f"[portrait] story: extracted lobby frame {png.name}", flush=True)
+    from PIL import Image as _Image
+
+    with _Image.open(png) as im:
+        inferred = meta_from_source_name(source.name, im.width, im.height)
     if meta_path is not None:
         meta = load_json(meta_path)
         print(f"[portrait] story: using meta {meta_path.name}", flush=True)
+        me = dict(meta.get("me") or {})
+        inf_me = inferred.get("me") or {}
+        if not str(me.get("champion") or "").strip() or str(me.get("champion")) in {"?", "Unknown"}:
+            if inf_me.get("champion"):
+                me["champion"] = inf_me["champion"]
+        meta["me"] = me
+        opp = dict(meta.get("opponent") or {})
+        inf_opp = inferred.get("opponent") or {}
+        if inf_opp.get("champion") and not str(opp.get("champion") or "").strip():
+            opp["champion"] = inf_opp["champion"]
+        meta["opponent"] = opp
     else:
-        from PIL import Image as _Image
-
-        with _Image.open(png) as im:
-            meta = meta_from_source_name(source.name, im.width, im.height)
+        meta = inferred
         print("[portrait] story: no lobby meta sidecar; inferred from filename + lobby PNG", flush=True)
     story_path = output.with_name(f"{output.stem}_lobby_story.mp4")
     build_story_video(
@@ -470,6 +482,7 @@ def build_filter(
     still_seconds: float = 0.0,
     still_mode: str = "story",
     still_from_input: int | None = None,
+    source_skip_s: float | None = None,
     fps: float = 30.0,
     game_mode: str = "crop",
     game_zoom: float = 1.0,
@@ -510,6 +523,7 @@ def build_filter(
         cam_hole=cam_hole,
     )
     still_s = max(0.0, float(still_seconds))
+    skip_s = still_s if source_skip_s is None else max(0.0, float(source_skip_s))
 
     kda_w = even(max(2, min(kda_w, src_w - max(0, kda_x))))
     kda_h = even(max(2, min(kda_h, src_h - max(0, kda_y))))
@@ -558,7 +572,7 @@ def build_filter(
     play_head = "[0:v]" if still_from_input is not None else "[v_play]"
     if kda_overlay:
         play = (
-            f"{play_head}trim=start={still_s:.3f},setpts=PTS-STARTPTS,split=3[cam_src][game_src][kda_src];"
+            f"{play_head}trim=start={skip_s:.3f},setpts=PTS-STARTPTS,split=3[cam_src][game_src][kda_src];"
             f"[cam_src]{cam_vf}[cam];"
             f"[game_src]{game_vf}[game];"
             f"[cam][game]vstack=inputs=2[base];"
@@ -567,7 +581,7 @@ def build_filter(
         )
     else:
         play = (
-            f"{play_head}trim=start={still_s:.3f},setpts=PTS-STARTPTS,split=2[cam_src][game_src];"
+            f"{play_head}trim=start={skip_s:.3f},setpts=PTS-STARTPTS,split=2[cam_src][game_src];"
             f"[cam_src]{cam_vf}[cam];"
             f"[game_src]{game_vf}[game];"
             f"[cam][game]vstack=inputs=2,format=yuv420p[play]"
@@ -582,7 +596,14 @@ def build_filter(
             f"setsar=1,fps={fps_s},format=yuv420p,"
             f"trim=duration={still_s:.3f},setpts=PTS-STARTPTS[still];"
         )
-        return still + play + ";[still][play]concat=n=2:v=1:a=0[v]"
+        return still + play + ";[still][play]concat=n=2:v=1:a=0[v]" + (
+            f";anullsrc=r=48000:cl=stereo:d={still_s:.3f}[asilent];"
+            f"[0:a]atrim=start={skip_s:.3f},asetpts=PTS-STARTPTS,"
+            f"aformat=sample_rates=48000:channel_layouts=stereo[agame];"
+            f"[asilent][agame]concat=n=2:v=0:a=1[a]"
+            if still_from_input is not None
+            else ""
+        )
 
     fit = still_fit_vf(out_w, out_h, mode=still_mode, src_w=src_w, src_h=src_h)
     return (
@@ -637,6 +658,8 @@ def render_portrait(
     info = probe(source)
     src_w = int(info["width"])
     src_h = int(info["height"])
+    has_baked_lobby = source.with_name(f"{source.stem}_lobby_intro.mp4").is_file()
+    weave_skip_s = float(still_seconds) if has_baked_lobby else 0.0
     cam_sx, cam_sy, cam_sw, cam_sh = scale_box(
         cam_x, cam_y, cam_w, cam_h, src_w=src_w, src_h=src_h
     )
@@ -697,7 +720,7 @@ def render_portrait(
                 init_x=box["crop_x"],
                 start=start,
                 duration=duration,
-                still_seconds=still_seconds,
+                still_seconds=weave_skip_s,
                 fps=track_fps,
                 dead_zone=track_dead_zone,
                 ease_s=max(0.05, float(track_ease_ms) / 1000.0),
@@ -728,6 +751,7 @@ def render_portrait(
             )
             filt_kwargs["still_from_input"] = 1
             filt_kwargs["fps"] = float(info["fps"])
+            filt_kwargs["source_skip_s"] = weave_skip_s
         except Exception as exc:
             print(f"[portrait] story intro failed ({exc}); falling back to champs", flush=True)
             filt_kwargs["still_mode"] = "champs"
@@ -785,8 +809,12 @@ def render_portrait(
         filt,
         "-map",
         "[v]",
-        "-map",
-        "0:a?",
+    ]
+    if story_mp4 is not None and "[a]" in filt:
+        cmd += ["-map", "[a]"]
+    else:
+        cmd += ["-map", "0:a?"]
+    cmd += [
         "-c:v",
         "libx264",
         "-preset",

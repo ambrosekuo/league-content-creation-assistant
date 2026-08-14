@@ -18,10 +18,10 @@ gcloud run jobs deploy vod-clip-process \
   --region="$REGION" \
   --execution-environment=gen2 \
   --task-timeout=2h \
-  --memory=4Gi \
-  --cpu=2 \
+  --memory=16Gi \
+  --cpu=8 \
   --max-retries=0 \
-  --set-env-vars="GCS_BUCKET=${GCS_BUCKET},GCS_PREFIX=vods,TWITCH_CHANNEL=lolambrosek,RIOT_REGION=americas,WORK_DIR=/tmp/vod-work,GCS_DAY_TZ=America/New_York" \
+  --set-env-vars="GCS_BUCKET=${GCS_BUCKET},GCS_PREFIX=vods,TWITCH_CHANNEL=lolambrosek,RIOT_ID=twtv lolAmbrosek#twtv,RIOT_REGION=americas,WORK_DIR=/tmp/vod-work,GCS_DAY_TZ=America/New_York" \
   --set-secrets="RIOT_API_KEY=RIOT_API_KEY:latest" \
   --command=python \
   --args="cloud_job.py,process-clips,--vod-id,${VOD_ID},--cleanup,--clean-work"

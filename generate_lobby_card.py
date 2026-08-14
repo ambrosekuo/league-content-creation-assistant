@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import io
 import json
 import os
@@ -159,15 +160,26 @@ def sort_by_role(players: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 _asset_cache: dict[str, bytes | None] = {}
+_ASSET_CACHE_DIR = Path(__file__).resolve().parent / ".cache" / "lol_assets"
 
 
 def cached_bytes(url: str) -> bytes | None:
     if url in _asset_cache:
         return _asset_cache[url]
+    key = hashlib.sha1(url.encode("utf-8")).hexdigest()[:20]
+    suffix = Path(url.split("?", 1)[0]).name or "bin"
+    disk = _ASSET_CACHE_DIR / f"{key}_{suffix}"
+    if disk.is_file():
+        data = disk.read_bytes()
+        _asset_cache[url] = data
+        return data
     try:
         data = http_bytes(url)
     except Exception:
         data = None
+    if data:
+        _ASSET_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        disk.write_bytes(data)
     _asset_cache[url] = data
     return data
 

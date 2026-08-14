@@ -1,6 +1,6 @@
-# Cloud Workflow: process-clips → process-portraits for one VOD.
-# Deploy: ./deploy/deploy_clip_then_portrait_workflow.sh
-# Run:   gcloud workflows run clip-then-portrait --data='{"vodId":"2843745368"}' --location=us-east1
+# Cloud Workflow: archive (ingest+cut) → process-clips → process-portraits.
+# Deploy: ./deploy/deploy_archive_clip_portrait_workflow.sh
+# Run:   gcloud workflows run archive-clip-portrait --data='{"vodId":"2844542226"}' --location=us-east1
 
 main:
   params: [input]
@@ -9,15 +9,34 @@ main:
         assign:
           - project_id: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
           - location: us-east1
-          - vod_id: ${default(map.get(input, "vodId"), "2843745368")}
+          - vod_id: ${default(map.get(input, "vodId"), "2844542226")}
+          - archive_job: ${"projects/" + project_id + "/locations/" + location + "/jobs/vod-archive-nightly"}
           - clip_job: ${"projects/" + project_id + "/locations/" + location + "/jobs/vod-clip-process"}
           - portrait_job: ${"projects/" + project_id + "/locations/" + location + "/jobs/vod-portrait-process"}
 
     - log_start:
-        call: sys.log 
+        call: sys.log
         args:
-          text: ${"clip-then-portrait start vodId=" + vod_id}
+          text: ${"archive-clip-portrait start vodId=" + vod_id}
           severity: INFO
+
+    - run_archive:
+        call: googleapis.run.v2.projects.locations.jobs.run
+        args:
+          name: ${archive_job}
+          body:
+            overrides:
+              containerOverrides:
+                - args:
+                    - cloud_job.py
+                    - process-vod
+                    - --vod-id
+                    - ${vod_id}
+                    - --cleanup
+                    - --fast
+          connector_params:
+            timeout: 86400
+        result: archive_op
 
     - run_clips:
         call: googleapis.run.v2.projects.locations.jobs.run
@@ -64,5 +83,6 @@ main:
     - done:
         return:
           vodId: ${vod_id}
+          archive: ${archive_op}
           clip: ${clip_op}
           portrait: ${portrait_op}

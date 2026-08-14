@@ -246,7 +246,7 @@ def iter_sample_frames(
     height: int = 540,
 ) -> Iterator[tuple[float, Image.Image]]:
     """Yield (time_in_segment, RGB frame) via ffmpeg rawvideo pipe."""
-    vf = f"fps={fps:.3f}"
+    vf = f"fps={fps:.3f},scale={width}:{height}:flags=fast_bilinear"
     cmd = ["ffmpeg", "-hide_banner", "-loglevel", "error"]
     if start and start > 0:
         cmd += ["-ss", f"{start:.3f}"]
@@ -283,10 +283,10 @@ def sample_detections(
     debug_dir: Path | None = None,
 ) -> list[Detection | None]:
     """One slot per sample. None = no lock. Times are seconds into the play stream."""
-    dw = src_w
-    dh = src_h
-    sx = 1.0
-    sy = 1.0
+    dw = min(960, even(max(2, src_w)))
+    dh = even(max(2, int(round(src_h * dw / max(src_w, 1)))))
+    sx = src_w / float(dw)
+    sy = src_h / float(dh)
     still = max(0.0, float(still_seconds))
     last_x: float | None = None
     last_full: float | None = None

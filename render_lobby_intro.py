@@ -4,7 +4,7 @@
 Works from a landscape lobby PNG (or the first frames of a weave) plus the
 sidecar JSON written by generate_lobby_card.py.
 
-Default camera story (3s): hold the full lobby, then one slow pan into
+Default camera story (3s): hold the full lobby, then one slow pan/zoom onto
 you vs the lane opponent and hold.
 """
 
@@ -302,17 +302,6 @@ def best_champ_slot(src, champ: str) -> tuple[int, str] | None:
     return None
 
 
-def _real_lobby_slots(meta: dict[str, Any]) -> bool:
-    players = meta.get("players") or []
-    named = [
-        p
-        for p in players
-        if str(p.get("champion") or "").strip() not in {"", "?", "Unknown"}
-    ]
-    me = meta.get("me") or {}
-    return len(named) >= 8 and me.get("col") is not None
-
-
 def align_meta_to_image(src, meta: dict[str, Any]) -> dict[str, Any]:
     """Put me/opponent boxes in this PNG's pixel space.
 
@@ -325,7 +314,7 @@ def align_meta_to_image(src, meta: dict[str, Any]) -> dict[str, Any]:
     opp = dict(out.get("opponent") or {})
     players = [dict(p) for p in (out.get("players") or [])]
     detected = detect_highlight_slot(src)
-    if detected is None and not _real_lobby_slots(out):
+    if detected is None:
         me_champ = str(me.get("champion") or "")
         try:
             detected = best_champ_slot(src, me_champ)
@@ -510,7 +499,11 @@ def story_boxes(src, meta: dict[str, Any]) -> dict[str, tuple[int, int, int, int
     full = content_box(meta, src.width, src.height)
     me = meta.get("me")
     opp = meta.get("opponent")
-    me_box = zoom_box_for_card(me, layout, src.width, src.height) if me else full
+    me_box = (
+        zoom_box_for_card(me, layout, src.width, src.height, card_frac=0.58)
+        if me
+        else full
+    )
     if me and opp:
         union = box_union(
             player_focus_box(me, layout, pad=12),
@@ -571,7 +564,7 @@ def render_story_frame(src, meta: dict[str, Any], t: float, duration: float):
     boxes = story_boxes(src, meta)
     hook = hook_from_meta(meta)
     full_end, vs_pan_end = story_beats(duration)
-    # full lobby → one pan to you vs opponent → hold
+    # full lobby → one pan/zoom onto the you-vs-lane column → hold
     if t <= full_end:
         box = boxes["full"]
     elif t <= vs_pan_end:
@@ -584,6 +577,7 @@ def render_story_frame(src, meta: dict[str, Any], t: float, duration: float):
     top, mid, bot = story_copy(t, hook, full_end=full_end)
     top_h = oy
     bot_y = oy + nh
+    bot_h = OUT_H - bot_y
 
     if t < full_end and top_h > 80:
         draw = ImageDraw.Draw(canvas)
@@ -595,19 +589,23 @@ def render_story_frame(src, meta: dict[str, Any], t: float, duration: float):
             draw_centered(draw, mid, cy=int(top_h * 0.72), fnt=f_mid, fill=WHITE)
         if bot:
             f_bot = fit_font(draw, bot, FONT_BOLD, 36, OUT_W - 64, 20)
-            draw_centered(draw, bot, cy=bot_y + (OUT_H - bot_y) // 2, fnt=f_bot, fill=WHITE)
+            draw_centered(draw, bot, cy=bot_y + bot_h // 2, fnt=f_bot, fill=WHITE)
         return canvas
 
-    canvas = _scrim(canvas, top=260, bot=300)
+    # Keep copy in the letterbox so it doesn't cover the card after the zoom.
+    if top_h < 160:
+        canvas = _scrim(canvas, top=260, bot=300)
+        top_h, bot_y, bot_h = 260, OUT_H - 300, 300
     draw = ImageDraw.Draw(canvas)
     if top:
         f_top = fit_font(draw, top, FONT_BLACK, 52, OUT_W - 70, 24)
-        draw_centered(draw, top, cy=110, fnt=f_top, fill=GOLD)
+        draw_centered(draw, top, cy=max(40, int(top_h * 0.38)), fnt=f_top, fill=GOLD)
+    vs_cy = bot_y + int(bot_h * (0.38 if bot else 0.50))
     f_vs = font(FONT_BLACK, 48)
-    draw_centered(draw, "VS", cy=OUT_H // 2, fnt=f_vs, fill=WHITE)
+    draw_centered(draw, mid or "VS", cy=vs_cy, fnt=f_vs, fill=WHITE)
     if bot:
         f_bot = fit_font(draw, bot, FONT_BLACK, 48, OUT_W - 70, 24)
-        draw_centered(draw, bot, cy=OUT_H - 130, fnt=f_bot, fill=RED)
+        draw_centered(draw, bot, cy=bot_y + int(bot_h * 0.70), fnt=f_bot, fill=RED)
     return canvas
 
 
@@ -816,6 +814,15 @@ def build_story_video(
 
     src = Image.open(lobby_image).convert("RGB")
     meta = align_meta_to_image(src, meta)
+    me = meta.get("me") or {}
+    opp = meta.get("opponent") or {}
+    print(
+        f"[story] zoom matchup {me.get('champion') or '?'} vs "
+        f"{opp.get('champion') or '?'} "
+        f"col={me.get('col')} me={me.get('row')} opp={opp.get('row')} "
+        f"@ ({me.get('x')},{me.get('y')})",
+        flush=True,
+    )
     return write_story_mp4(src, meta, output, seconds=seconds, fps=fps)
 
 
@@ -896,7 +903,7 @@ def main(argv: list[str] | None = None) -> int:
         mp4 = out_dir / "03_story.mp4"
         write_story_mp4(src, meta, mp4, seconds=float(args.seconds))
         written["story"] = str(mp4)
-        for label, t in (("full", 0.35), ("vs", 2.50)):
+        for label, t in (("full", 0.35), ("me", 2.50)):
             frame = render_story_frame(src, meta, t, float(args.seconds))
             path = out_dir / f"03_story_{label}.jpg"
             frame.save(path, quality=92)

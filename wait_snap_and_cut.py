@@ -122,7 +122,7 @@ def main() -> int:
             "--types",
             "KILL,DEATH",
             "--force",
-            "--reencode",
+            "--stream-copy",
         ],
         cwd=str(root),
         capture_output=True,

@@ -203,22 +203,22 @@ def cut_clip(
     end: float,
     reencode: bool,
     *,
-    stream_copy: bool = False,
+    stream_copy: bool = True,
     accurate: bool = False,
 ) -> None:
     """
     Cut [start, end) from source.
 
-    Default: ``-ss`` *before* ``-i`` + libx264 ``superfast``. Fast on long VODs
-    (no decode-from-start) and avoids stream-copy frozen open frames.
-
-    ``accurate=True``: ``-ss`` after ``-i`` (frame-exact; slow on multi-hour sources).
-    ``reencode=True``: higher-quality ``veryfast`` preset (implies accurate seek).
-    ``stream_copy=True``: ``-c copy`` (fastest; can freeze until next keyframe).
+    Default: ``-c copy`` (no encoder). Start may freeze until the next
+    keyframe; stitch freeze-detect drops that. Encoding only happens when
+    ``reencode=True``.
     """
     duration = max(0.1, end - start)
-    if stream_copy and not reencode and not accurate:
-        # Fast but can freeze/hang the first frames until the next keyframe.
+    if not reencode:
+        if not stream_copy:
+            raise ValueError(
+                "clip cuts are stream-copy only; pass --reencode to encode"
+            )
         command = [
             "ffmpeg",
             "-y",
@@ -234,6 +234,8 @@ def cut_clip(
             "make_zero",
             str(output),
         ]
+        run(command)
+        return
     else:
         # accurate / reencode: seek after -i (exact, slow on long files).
         # default: seek before -i (orders of magnitude faster on 9h VODs).
@@ -353,16 +355,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--accurate",
         action="store_true",
         help=(
-            "Frame-exact seek (-ss after -i). Slow on multi-hour sources. "
-            "Default seeks before -i + superfast encode (much faster)."
+            "Frame-exact seek (-ss after -i) with a superfast encode. "
+            "Slow on multi-hour sources. Default is stream copy."
         ),
     )
     parser.add_argument(
         "--stream-copy",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help=(
-            "Use ffmpeg -c copy (fastest, but often freezes/hangs the first "
-            "frames until a keyframe). Not recommended for publishable clips."
+            "ffmpeg -c copy (default: on). Fastest; start may freeze until a "
+            "keyframe — stitch --detect-freeze cuts that. Use --no-stream-copy "
+            "to superfast-encode instead."
         ),
     )
     parser.add_argument(

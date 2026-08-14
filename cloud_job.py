@@ -282,6 +282,7 @@ def _cut_clips(
     force: bool,
     from_windows: Path | None = None,
     reencode: bool = False,
+    stream_copy: bool = True,
     resume: bool = False,
     versioned: bool = False,
     clips_subdir: str | None = None,
@@ -337,6 +338,8 @@ def _cut_clips(
         cmd.append("--force")  # allow rewriting clips.json while skipping mp4s
     if reencode:
         cmd.append("--reencode")
+    else:
+        cmd.append("--stream-copy")
     if publish_gcs_vod_id:
         cmd.extend(["--publish-gcs-vod-id", publish_gcs_vod_id])
     # Pad matches stitch trim so snap pre/post-roll survives freeze removal.
@@ -363,7 +366,8 @@ def cmd_recut_clips(args: argparse.Namespace) -> int:
     replaces lol_clips/ + lol_events_snapped.json in the archive.
 
     --fast: versioned folder, publish each clip to GCS, resume skips;
-    cuts use fast seek-before encode (not stream-copy / not ultrafast accurate).
+    cuts default to stream-copy (no encoder). Stitch freeze-detect trims
+    keyframe freezes. --reencode for frame-accurate libx264.
     """
     import shutil
 
@@ -376,9 +380,9 @@ def cmd_recut_clips(args: argparse.Namespace) -> int:
     fast = bool(getattr(args, "fast", False))
     resume = bool(getattr(args, "resume", False) or fast)
     versioned = bool(getattr(args, "versioned", False) or fast)
-    # Default / --fast: -ss before -i + superfast (fast on long VODs).
-    # --reencode: veryfast + accurate seek. Never stream-copy by default.
+    # Default / --fast: -c copy (no encoder). --reencode: veryfast + accurate seek.
     reencode = bool(getattr(args, "reencode", False))
+    stream_copy = bool(getattr(args, "stream_copy", True)) and not reencode
     publish = bool(getattr(args, "publish_incremental", False) or fast)
 
     if args.dataset_dir:
@@ -442,7 +446,11 @@ def cmd_recut_clips(args: argparse.Namespace) -> int:
             )
             print(f"[cut] versioned output → {clips_subdir}", flush=True)
 
-    mode = "superfast/seek-before" if not reencode else "reencode/veryfast+accurate"
+    mode = (
+        "reencode/veryfast+accurate"
+        if reencode
+        else ("stream-copy" if stream_copy else "superfast/seek-before")
+    )
     print(f"[cut] {vod_id} ({mode}, resume={resume}, versioned={versioned})", flush=True)
     clips_dir = _cut_clips(
         dataset_dir,
@@ -451,6 +459,7 @@ def cmd_recut_clips(args: argparse.Namespace) -> int:
         force=True,
         from_windows=from_windows,
         reencode=reencode,
+        stream_copy=stream_copy,
         resume=resume,
         versioned=versioned,
         clips_subdir=clips_subdir,
@@ -474,6 +483,7 @@ def cmd_recut_clips(args: argparse.Namespace) -> int:
         "transcriptSnap": bool(from_windows),
         "fast": fast,
         "reencode": reencode,
+        "streamCopy": stream_copy,
         "resume": resume,
         "clipsDir": str(clips_dir),
         "clipsPrefix": (
@@ -547,14 +557,20 @@ def cmd_process_clips(args: argparse.Namespace) -> int:
         "--min-clips",
         str(args.min_clips),
         "--force",
-        "--trim-lead",
-        str(PAD_LEAD_S),
-        "--trim-trail",
-        str(PAD_TRAIL_S),
     ]
-    if args.reencode:
-        stitch_cmd.append("--reencode")
-    print(f"[stitch] {vod_id} from {clips_subdir}/", flush=True)
+    if getattr(args, "detect_freeze", True):
+        stitch_cmd.append("--detect-freeze")
+    else:
+        stitch_cmd += [
+            "--no-detect-freeze",
+            "--trim-lead",
+            str(PAD_LEAD_S),
+            "--trim-trail",
+            str(PAD_TRAIL_S),
+        ]
+    if getattr(args, "reencode", False):
+        print("[stitch] --reencode ignored: clip job is stream-copy only", flush=True)
+    print(f"[stitch] {vod_id} from {clips_subdir}/ (copy-trim, no encode)", flush=True)
     _run(stitch_cmd)
 
     print(f"[upload] compilations for {vod_id}", flush=True)
@@ -618,6 +634,9 @@ def cmd_process_portraits(args: argparse.Namespace) -> int:
         },
         key=lambda p: p.name,
     )
+    if getattr(args, "max_weaves", 0):
+        weaves = weaves[: max(0, int(args.max_weaves))]
+        print(f"[portrait] limited to first {len(weaves)} weave(s)", flush=True)
     if not weaves:
         raise FileNotFoundError(
             f"No gam*.mp4 or *_weave.mp4 under {comp_dir} "
@@ -887,7 +906,7 @@ def _finalize_and_upload(
     elif cut_clips and not _transcript_snap_enabled():
         print("[snap] TRANSCRIPT_SNAP disabled; cutting raw Riot windows", flush=True)
 
-    # Default: -ss before -i + superfast (avoids stream-copy freezes + decode-from-start).
+    # Default: -c copy (no encoder). Stitch freeze-detect drops keyframe freezes.
     reencode = False
     resume = fast
     publish = fast
@@ -911,7 +930,7 @@ def _finalize_and_upload(
 
     clips_dir: Path | None = None
     if cut_clips:
-        mode = "superfast/seek-before"
+        mode = "stream-copy"
         print(f"[cut] {vod_id} ({mode})", flush=True)
         clips_dir = _cut_clips(
             dataset_dir,
@@ -920,6 +939,7 @@ def _finalize_and_upload(
             force=True,
             from_windows=from_windows,
             reencode=reencode,
+            stream_copy=True,
             resume=resume,
             versioned=versioned,
             clips_subdir=clips_subdir,
@@ -1543,6 +1563,8 @@ def cmd_process_segmented(args: argparse.Namespace) -> int:
             ]
             if getattr(args, "reencode", False):
                 cut_cmd.append("--reencode")
+            else:
+                cut_cmd.append("--stream-copy")
             if from_windows is not None:
                 cut_cmd.extend(["--from-windows", str(from_windows)])
             if args.max_clips > 0:
@@ -1713,8 +1735,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--fast",
         action="store_true",
         help=(
-            "Incremental GCS publish + resume (fast seek-before + superfast encode; "
-            "not stream-copy)"
+            "Incremental GCS publish + resume. Cuts are stream-copy (no encoder)."
         ),
     )
     p_one.add_argument(
@@ -1758,8 +1779,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Versioned lol_clips_<timestamp> if lol_clips exists, publish each "
-            "clip to GCS immediately, resume skips. Cuts use seek-before + "
-            "superfast encode (not stream-copy)."
+            "clip to GCS immediately, resume skips. Cuts are stream-copy "
+            "(no encoder) unless --reencode."
         ),
     )
     p_recut.add_argument(
@@ -1768,8 +1789,14 @@ def build_parser() -> argparse.ArgumentParser:
         default=False,
         help=(
             "libx264 veryfast + frame-accurate seek after -i (slow on long VODs). "
-            "Default is seek-before + superfast."
+            "Default is stream-copy (no encoder)."
         ),
+    )
+    p_recut.add_argument(
+        "--stream-copy",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="ffmpeg -c copy when cutting (default: on). Encoding is opt-in via --reencode.",
     )
     p_recut.add_argument(
         "--resume",
@@ -1835,7 +1862,13 @@ def build_parser() -> argparse.ArgumentParser:
     p_clips.add_argument(
         "--reencode",
         action="store_true",
-        help="Force re-encode when stitching (default: try stream copy)",
+        help="Ignored. Clip job is stream-copy only.",
+    )
+    p_clips.add_argument(
+        "--detect-freeze",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Drop frozen frames at the start/end of each clip when stitching (default: on)",
     )
     p_clips.add_argument(
         "--clean-work",
@@ -1864,6 +1897,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Use local dataset with lol_compilations/ (skip GCS restore)",
     )
     p_port.add_argument("--work-dir", type=Path, default=None)
+    p_port.add_argument(
+        "--max-weaves",
+        type=int,
+        default=0,
+        help="Only render the first N weaves (0 = all). Useful for a single-game test.",
+    )
     p_port.add_argument(
         "--still-seconds",
         type=float,
