@@ -168,18 +168,40 @@ def _client():
         return storage.Client(project=project, credentials=creds)
 
 
+def assets_bucket_name() -> str:
+    """Bucket for render assets. Defaults to GCS_BUCKET (same archive bucket)."""
+    return (os.environ.get("GCS_ASSETS_BUCKET") or bucket_name()).strip()
+
+
+def assets_prefix() -> str:
+    return (os.environ.get("GCS_ASSETS_PREFIX") or "assets").strip().strip("/")
+
+
+def assets_uri() -> str:
+    return f"gs://{assets_bucket_name()}/{assets_prefix()}/"
+
+
 def blob_exists(object_name: str) -> bool:
     client = _client()
     bucket = client.bucket(bucket_name())
     return bucket.blob(object_name).exists()
 
 
-def upload_file(local_path: Path, object_name: str, *, content_type: str | None = None) -> str:
+def upload_file(
+    local_path: Path,
+    object_name: str,
+    *,
+    content_type: str | None = None,
+    bucket: str | None = None,
+    storage_class: str | None = None,
+) -> str:
     client = _client()
-    bucket = client.bucket(bucket_name())
-    blob = bucket.blob(object_name)
+    bname = (bucket or bucket_name()).strip()
+    blob = client.bucket(bname).blob(object_name)
+    if storage_class:
+        blob.storage_class = storage_class
     blob.upload_from_filename(str(local_path), content_type=content_type)
-    return f"gs://{bucket_name()}/{object_name}"
+    return f"gs://{bname}/{object_name}"
 
 
 def delete_prefix(object_prefix: str) -> int:
@@ -205,10 +227,15 @@ def upload_json(payload: dict[str, Any] | list[Any], object_name: str) -> str:
     return f"gs://{bucket_name()}/{object_name}"
 
 
-def download_file(object_name: str, local_path: Path) -> Path:
+def download_file(
+    object_name: str,
+    local_path: Path,
+    *,
+    bucket: str | None = None,
+) -> Path:
     client = _client()
-    bucket = client.bucket(bucket_name())
-    blob = bucket.blob(object_name)
+    bname = (bucket or bucket_name()).strip()
+    blob = client.bucket(bname).blob(object_name)
     local_path.parent.mkdir(parents=True, exist_ok=True)
     blob.download_to_filename(str(local_path))
     return local_path
@@ -606,13 +633,21 @@ def restore_source_checkpoint(vod_id: str, dataset_dir: Path) -> Path:
     return local_source
 
 
-def download_prefix(object_prefix: str, local_dir: Path, *, suffix: str | None = None) -> list[Path]:
+def download_prefix(
+    object_prefix: str,
+    local_dir: Path,
+    *,
+    suffix: str | None = None,
+    bucket: str | None = None,
+    skip_existing: bool = False,
+) -> list[Path]:
     """Download all objects under a GCS prefix into local_dir (preserving relative paths)."""
     client = _client()
-    bucket = client.bucket(bucket_name())
+    bname = (bucket or bucket_name()).strip()
+    gcs_bucket = client.bucket(bname)
     local_dir.mkdir(parents=True, exist_ok=True)
     downloaded: list[Path] = []
-    for blob in client.list_blobs(bucket, prefix=object_prefix):
+    for blob in client.list_blobs(gcs_bucket, prefix=object_prefix):
         name = blob.name
         if name.endswith("/"):
             continue
@@ -622,8 +657,16 @@ def download_prefix(object_prefix: str, local_dir: Path, *, suffix: str | None =
         if not rel:
             continue
         dest = local_dir / rel
+        if (
+            skip_existing
+            and dest.is_file()
+            and blob.size is not None
+            and dest.stat().st_size == int(blob.size)
+        ):
+            downloaded.append(dest)
+            continue
         dest.parent.mkdir(parents=True, exist_ok=True)
-        print(f"[download] gs://{bucket_name()}/{name} → {dest}", flush=True)
+        print(f"[download] gs://{bname}/{name} → {dest}", flush=True)
         blob.download_to_filename(str(dest))
         downloaded.append(dest)
     return downloaded
@@ -907,3 +950,114 @@ def upload_dataset_dir(dataset_dir: Path, *, vod_id: str | None = None) -> dict[
     uploaded["_manifest.json"] = upload_json(manifest, f"{base}/_upload_manifest.json")
     print(f"[upload] gs://{bucket_name()}/{base}/", flush=True)
     return uploaded
+
+
+_ASSET_SKIP_NAMES = {".DS_Store", ".gitkeep", "Thumbs.db"}
+_ASSET_SKIP_DIRS = {"files"}
+_ASSET_EXTS = {
+    ".wav",
+    ".mp3",
+    ".ogg",
+    ".m4a",
+    ".png",
+    ".jpg",
+    ".jpeg",
+    ".webp",
+    ".gif",
+    ".json",
+    ".ttf",
+    ".otf",
+}
+_ASSET_CONTENT_TYPES = {
+    ".wav": "audio/wav",
+    ".mp3": "audio/mpeg",
+    ".ogg": "audio/ogg",
+    ".m4a": "audio/mp4",
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".webp": "image/webp",
+    ".gif": "image/gif",
+    ".json": "application/json",
+    ".ttf": "font/ttf",
+    ".otf": "font/otf",
+}
+# Portrait outro / overlay / music bed. Warn if these are missing after restore.
+REQUIRED_RENDER_ASSETS = (
+    "brand/heart_hands.png",
+    "brand/face_leblanc_classic.png",
+    "brand/streamers.json",
+    "brand/pros.json",
+    "stings/inbox/264981__renatalmar__sfx-magic.wav",
+    "stings/suggested/loss_253886_negative_beeps_wav.wav",
+    "stings/suggested/sparkle_511485_cartoon_wink_magic_sparkle_wav.wav",
+    "music/catalog.json",
+)
+
+
+def _iter_render_asset_files(assets_root: Path) -> list[Path]:
+    """Local brand stills, sting audio, and music beds (not the Freesound cache)."""
+    out: list[Path] = []
+    for sub in ("brand", "stings", "music"):
+        base = assets_root / sub
+        if not base.exists():
+            continue
+        for path in base.rglob("*"):
+            if not path.is_file():
+                continue
+            if path.name in _ASSET_SKIP_NAMES or path.stat().st_size <= 0:
+                continue
+            rel = path.relative_to(assets_root)
+            if any(part in _ASSET_SKIP_DIRS for part in rel.parts):
+                continue
+            if path.suffix.lower() not in _ASSET_EXTS:
+                continue
+            out.append(path)
+    return sorted(out)
+
+
+def upload_render_assets(assets_root: Path) -> dict[str, str]:
+    """Push the local portrait pack to gs://$BUCKET/assets/ as STANDARD (not Coldline)."""
+    assets_root = assets_root.resolve()
+    if not assets_root.is_dir():
+        raise FileNotFoundError(assets_root)
+    files = _iter_render_asset_files(assets_root)
+    if not files:
+        raise FileNotFoundError(f"No render assets under {assets_root}")
+    uploaded: dict[str, str] = {}
+    bname = assets_bucket_name()
+    prefix = assets_prefix()
+    for path in files:
+        rel = path.relative_to(assets_root).as_posix()
+        object_name = f"{prefix}/{rel}"
+        print(f"[assets] upload {rel}", flush=True)
+        uploaded[rel] = upload_file(
+            path,
+            object_name,
+            content_type=_ASSET_CONTENT_TYPES.get(path.suffix.lower()),
+            bucket=bname,
+            storage_class="STANDARD",
+        )
+    print(f"[assets] {len(uploaded)} file(s) → {assets_uri()}", flush=True)
+    return uploaded
+
+
+def restore_render_assets(assets_root: Path, *, skip_existing: bool = True) -> list[Path]:
+    """Pull gs://$BUCKET/assets/ into the local assets/ tree used by rank cards."""
+    dest = assets_root.resolve()
+    dest.mkdir(parents=True, exist_ok=True)
+    files = download_prefix(
+        f"{assets_prefix()}/",
+        dest,
+        bucket=assets_bucket_name(),
+        skip_existing=skip_existing,
+    )
+    missing = [rel for rel in REQUIRED_RENDER_ASSETS if not (dest / rel).is_file()]
+    if missing:
+        print(
+            f"[assets] missing after restore ({assets_uri()}): {', '.join(missing)}",
+            flush=True,
+        )
+    else:
+        print(f"[assets] {len(files)} file(s) ready under {dest}", flush=True)
+    return files

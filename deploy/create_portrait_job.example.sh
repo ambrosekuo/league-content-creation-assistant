@@ -31,7 +31,10 @@ echo "  gcloud run jobs execute vod-portrait-process --region=$REGION"
 echo "Override VOD:"
 echo "  VOD_ID=OTHER ./deploy/create_portrait_job.example.sh"
 echo
+echo "Sync stings/music/brand stills (once, or after you change a file):"
+echo "  python cloud_job.py upload-assets"
+echo
 echo "Local (no Cloud Run):"
 echo "  python cloud_job.py process-portraits --vod-id ${VOD_ID} --cleanup --clean-work --force"
 echo "  # or against a local folder:"
-echo "  python cloud_job.py process-portraits --vod-id ${VOD_ID} --dataset-dir /path/with/lol_compilations"
+echo "  python cloud_job.py process-portraits --vod-id ${VOD_ID} --dataset-dir /path/with/lol_compilations --skip-assets"

@@ -22,7 +22,7 @@ Scaffolding lives in `cloud_job.py`, `storage_gcs.py`, `Dockerfile`, and `deploy
 - `.dockerignore` excludes `data/` so image builds never package in-progress VODs.
 - `upload-dataset` refuses folders that still contain `*.part` files.
 
-See [deploy/README.md](deploy/README.md).
+See [deploy/README.md](deploy/README.md). Portrait stings/music are gitignored; Cloud Run pulls them from `gs://$GCS_BUCKET/assets/` (`python cloud_job.py upload-assets`).
 
 ## Local archive viewer
 

@@ -49,9 +49,29 @@ MUTED = (180, 186, 198)
 GREEN = (86, 214, 140)
 RED = (255, 92, 92)
 
-FONT_BLACK = "/System/Library/Fonts/Supplemental/Arial Black.ttf"
-FONT_BOLD = "/System/Library/Fonts/Supplemental/Arial Bold.ttf"
-FONT_REG = "/System/Library/Fonts/Supplemental/Arial.ttf"
+
+def _first_existing(*candidates: str) -> str:
+    for path in candidates:
+        if path and Path(path).is_file():
+            return path
+    return candidates[-1]
+
+
+FONT_BLACK = _first_existing(
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/System/Library/Fonts/Supplemental/Arial Black.ttf",
+)
+FONT_BOLD = _first_existing(
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+    "/System/Library/Fonts/Supplemental/Arial Bold.ttf",
+)
+FONT_REG = _first_existing(
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/System/Library/Fonts/Supplemental/Arial.ttf",
+)
 
 DEFAULT_FACE = ROOT / "assets" / "brand" / "face_leblanc_classic.png"
 DEFAULT_END_FACE = ROOT / "assets" / "brand" / "heart_hands.png"

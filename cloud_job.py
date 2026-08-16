@@ -46,6 +46,44 @@ def cmd_gcs_list(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_upload_assets(args: argparse.Namespace) -> int:
+    import storage_gcs as gcs
+
+    root = Path(args.assets_dir).resolve() if args.assets_dir else ROOT / "assets"
+    uploaded = gcs.upload_render_assets(root)
+    print(
+        json.dumps(
+            {
+                "status": "upload_assets",
+                "uri": gcs.assets_uri(),
+                "uploaded": len(uploaded),
+                "objects": uploaded,
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
+def cmd_restore_assets(args: argparse.Namespace) -> int:
+    import storage_gcs as gcs
+
+    root = Path(args.assets_dir).resolve() if args.assets_dir else ROOT / "assets"
+    files = gcs.restore_render_assets(root, skip_existing=not args.force)
+    print(
+        json.dumps(
+            {
+                "status": "restore_assets",
+                "uri": gcs.assets_uri(),
+                "files": len(files),
+                "dir": str(root),
+            },
+            indent=2,
+        )
+    )
+    return 0
+
+
 def cmd_upload_dataset(args: argparse.Namespace) -> int:
     import storage_gcs as gcs
 
@@ -702,6 +740,10 @@ def cmd_process_portraits(args: argparse.Namespace) -> int:
     work_dir = Path(os.environ.get("WORK_DIR") or args.work_dir or "/tmp/vod-work")
     work_dir.mkdir(parents=True, exist_ok=True)
     dataset_dir = Path(args.dataset_dir).resolve() if args.dataset_dir else work_dir / vod_id
+
+    if not args.skip_assets and gcs.is_configured():
+        print(f"[assets] restore {gcs.assets_uri()} → {ROOT / 'assets'}", flush=True)
+        gcs.restore_render_assets(ROOT / "assets")
 
     if args.dataset_dir:
         comp_dir = dataset_dir / "lol_compilations"
@@ -1810,6 +1852,30 @@ def build_parser() -> argparse.ArgumentParser:
     p_gcs = sub.add_parser("gcs-list", help="List VOD ids already in GCS")
     p_gcs.set_defaults(func=cmd_gcs_list)
 
+    p_assets = sub.add_parser(
+        "upload-assets",
+        help="Upload local assets/brand|stings|music to gs://$GCS_BUCKET/assets/",
+    )
+    p_assets.add_argument(
+        "--assets-dir",
+        type=Path,
+        default=None,
+        help="Local assets folder (default: ./assets)",
+    )
+    p_assets.set_defaults(func=cmd_upload_assets)
+
+    p_rest_assets = sub.add_parser(
+        "restore-assets",
+        help="Download gs://$GCS_BUCKET/assets/ into ./assets",
+    )
+    p_rest_assets.add_argument("--assets-dir", type=Path, default=None)
+    p_rest_assets.add_argument(
+        "--force",
+        action="store_true",
+        help="Re-download even when a local file already matches the GCS size",
+    )
+    p_rest_assets.set_defaults(func=cmd_restore_assets)
+
     p_up = sub.add_parser("upload-dataset", help="Upload a completed local dataset to GCS")
     p_up.add_argument("--dataset-dir", type=Path, required=True)
     p_up.add_argument("--vod-id", default=None)
@@ -2165,6 +2231,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_port.add_argument("--music-db", type=float, default=-20.0)
     p_port.add_argument("--preset", default="veryfast", help="x264 preset (default: veryfast)")
     p_port.add_argument("--crf", type=int, default=20)
+    p_port.add_argument(
+        "--skip-assets",
+        action="store_true",
+        help="Do not pull gs://$GCS_BUCKET/assets/ (use files already on disk)",
+    )
     p_port.add_argument(
         "--force",
         action="store_true",
