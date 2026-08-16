@@ -24,6 +24,37 @@ Scaffolding lives in `cloud_job.py`, `storage_gcs.py`, `Dockerfile`, and `deploy
 
 See [deploy/README.md](deploy/README.md).
 
+## Local archive viewer
+
+Browse processed videos in `data/` (and GCS when `GCS_BUCKET` is set), play them, keep/skip, and requeue Cloud Run jobs:
+
+```bash
+python -m pip install -r requirements-viewer.txt
+python -m viewer
+```
+
+Opens at http://127.0.0.1:8787. Playback prefers local files; GCS-only objects can be pulled to `data/` first. Notes and keep/skip flags live in `data/_viewer/reviews.json`.
+
+## Local soundbytes (Freesound CC0)
+
+`assets/stings/inbox/` is the drop folder for sounds you pick. `assets/stings/suggested/` is dopamine-like CC0 picks (cash register, coin). `assets/stings/intro/` is intro / ident stings only.
+
+```bash
+python fetch_stings.py --list
+python fetch_stings.py --suggest
+python fetch_stings.py --adopt ~/Downloads/209578__zott820__cash-register-purchase.wav
+```
+
+## Local GIFs (Wikimedia Commons)
+
+`assets/gifs/inbox/` is the drop folder. `assets/gifs/suggested/` is filled from Wikimedia Commons: native GIFs, or a 2.5s ffmpeg clip of a CC video. No API key. Openverse has almost no climbing GIFs, so stills are not used.
+
+```bash
+python fetch_gifs.py --list
+python fetch_gifs.py --suggest
+python fetch_gifs.py --adopt ~/Downloads/some.gif
+```
+
 ## Do I need to download the whole VOD?
 
 For the first version, **yes**. Downloading the complete VOD gives you a stable local timeline and lets later stages repeatedly:

@@ -1,6 +1,7 @@
-# Cloud Workflow: archive (ingest+cut) → process-clips → process-portraits.
-# Deploy: ./deploy/deploy_archive_clip_portrait_workflow.sh
-# Run:   gcloud workflows run archive-clip-portrait --data='{"vodId":"2844542226"}' --location=us-east1
+# Cloud Workflow: archive (ingest+cut) → process-clips.
+# Portraits are manual: run vod-portrait-process after weaves are ready.
+# Deploy: gcloud workflows deploy archive-clip-portrait --location=us-east1 --source=deploy/workflow_archive_clip_portrait.yaml
+# Run:   gcloud workflows run archive-clip-portrait --data='{"vodId":"2846435808"}' --location=us-east1
 
 main:
   params: [input]
@@ -9,15 +10,14 @@ main:
         assign:
           - project_id: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
           - location: us-east1
-          - vod_id: ${default(map.get(input, "vodId"), "2844542226")}
+          - vod_id: ${default(map.get(input, "vodId"), "2846435808")}
           - archive_job: ${"projects/" + project_id + "/locations/" + location + "/jobs/vod-archive-nightly"}
           - clip_job: ${"projects/" + project_id + "/locations/" + location + "/jobs/vod-clip-process"}
-          - portrait_job: ${"projects/" + project_id + "/locations/" + location + "/jobs/vod-portrait-process"}
 
     - log_start:
         call: sys.log
         args:
-          text: ${"archive-clip-portrait start vodId=" + vod_id}
+          text: ${"archive-then-clip start vodId=" + vod_id}
           severity: INFO
 
     - run_archive:
@@ -56,33 +56,8 @@ main:
             timeout: 7200
         result: clip_op
 
-    - run_portraits:
-        call: googleapis.run.v2.projects.locations.jobs.run
-        args:
-          name: ${portrait_job}
-          body:
-            overrides:
-              containerOverrides:
-                - args:
-                    - cloud_job.py
-                    - process-portraits
-                    - --vod-id
-                    - ${vod_id}
-                    - --cleanup
-                    - --clean-work
-                    - --force
-                    - --preset
-                    - veryfast
-                    - --crf
-                    - "20"
-                    - --track-champion
-          connector_params:
-            timeout: 14400
-        result: portrait_op
-
     - done:
         return:
           vodId: ${vod_id}
           archive: ${archive_op}
           clip: ${clip_op}
-          portrait: ${portrait_op}

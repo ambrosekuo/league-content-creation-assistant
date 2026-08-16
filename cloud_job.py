@@ -503,8 +503,9 @@ def cmd_process_clips(args: argparse.Namespace) -> int:
     Post-process existing lol_clips/ in GCS (no Twitch / no source.mp4).
 
     Current tasks:
+      - rank lol_clips and keep the top K per game (default 5)
       - generate lobby card intro (~3s) per game
-      - stitch each gNN_Champ folder into lol_compilations/{folder}_weave.mp4
+      - stitch selected clips into lol_compilations/gamNN_*.mp4
     """
     import shutil
 
@@ -556,8 +557,12 @@ def cmd_process_clips(args: argparse.Namespace) -> int:
         str(dataset_dir / clips_subdir),
         "--min-clips",
         str(args.min_clips),
+        "--top-k",
+        str(int(getattr(args, "top_k", 5))),
         "--force",
     ]
+    if getattr(args, "no_rank", False):
+        stitch_cmd.append("--no-rank")
     if getattr(args, "detect_freeze", True):
         stitch_cmd.append("--detect-freeze")
     else:
@@ -570,7 +575,11 @@ def cmd_process_clips(args: argparse.Namespace) -> int:
         ]
     if getattr(args, "reencode", False):
         print("[stitch] --reencode ignored: clip job is stream-copy only", flush=True)
-    print(f"[stitch] {vod_id} from {clips_subdir}/ (copy-trim, no encode)", flush=True)
+    print(
+        f"[stitch] {vod_id} from {clips_subdir}/ "
+        f"top_k={getattr(args, 'top_k', 5)} (copy-trim, no encode)",
+        flush=True,
+    )
     _run(stitch_cmd)
 
     print(f"[upload] compilations for {vod_id}", flush=True)
@@ -581,11 +590,99 @@ def cmd_process_clips(args: argparse.Namespace) -> int:
         "vodId": vod_id,
         "origin": origin,
         "uploaded": len(uploaded),
+        "topK": int(getattr(args, "top_k", 5)),
+        "rank": not bool(getattr(args, "no_rank", False)),
         "compilationsPrefix": f"gs://{gcs.bucket_name()}/{prefix}/lol_compilations/",
         "objects": uploaded,
     }
     if args.cleanup and not args.dataset_dir:
         shutil.rmtree(dataset_dir, ignore_errors=True)
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+def cmd_process_daily(args: argparse.Namespace) -> int:
+    """Rank every clip from every VOD on a calendar day and stitch one compilation."""
+    import shutil
+
+    import storage_gcs as gcs
+
+    day = str(getattr(args, "day_key", "") or "").strip().lower()
+    vod_id = str(getattr(args, "vod_id", "") or "").strip().lstrip("v")
+    if not day and vod_id:
+        try:
+            day = gcs.resolve_day_key(vod_id, args.dataset_dir)
+        except Exception as exc:
+            print(f"[daily] day-key lookup skipped: {exc}", flush=True)
+    if not day and args.dataset_dir:
+        day = gcs.day_key_from_dataset(args.dataset_dir) or "local"
+    if not day:
+        raise ValueError("Provide --day-key (e.g. aug12_2026) or --vod-id to derive the day")
+
+    work_dir = Path(os.environ.get("WORK_DIR") or args.work_dir or "/tmp/vod-work")
+    staging = Path(args.dataset_dir).resolve() if args.dataset_dir else work_dir / f"daily_{day}"
+    origin = "dataset_dir"
+    vods: list[str] = []
+    if args.dataset_dir:
+        if not staging.exists():
+            raise FileNotFoundError(f"Missing dataset dir {staging}")
+    else:
+        if staging.exists() and args.clean_work:
+            shutil.rmtree(staging, ignore_errors=True)
+        print(f"[daily] restore clips for {day}", flush=True)
+        vods = gcs.restore_day_clips(day, staging)
+        origin = "gcs_day"
+        if not vods:
+            raise FileNotFoundError(f"No lol_clips for day {day} in GCS")
+
+    clips_dir = staging / "lol_clips" if (staging / "lol_clips").is_dir() else staging
+    out_dir = staging / "lol_compilations_daily"
+    top_k = int(getattr(args, "top_k", 12) or 12)
+    stitch_cmd = [
+        sys.executable,
+        str(ROOT / "stitch_game_clips.py"),
+        "--dataset-dir",
+        str(staging),
+        "--clips-dir",
+        str(clips_dir),
+        "--output-dir",
+        str(out_dir),
+        "--daily",
+        "--top-k",
+        str(top_k),
+        "--max-per-game",
+        str(int(getattr(args, "max_per_game", 3))),
+        "--order",
+        str(getattr(args, "order", "chrono")),
+        "--min-clips",
+        "1",
+        "--no-lobby",
+        "--force",
+    ]
+    print(f"[daily] stitch top {top_k} across {day}", flush=True)
+    _run(stitch_cmd)
+
+    uploaded: dict[str, str] = {}
+    daily_prefix = None
+    if not args.dataset_dir or getattr(args, "upload", False):
+        print(f"[upload] daily compilation for {day}", flush=True)
+        uploaded = gcs.upload_daily_artifacts(out_dir, day_key=day)
+        daily_prefix = f"gs://{gcs.bucket_name()}/{gcs.prefix()}/{day}/_daily/"
+
+    result = {
+        "status": "process_daily",
+        "dayKey": day,
+        "origin": origin,
+        "vods": vods,
+        "topK": top_k,
+        "maxPerGame": int(getattr(args, "max_per_game", 3)),
+        "outputDir": str(out_dir),
+        "uploaded": len(uploaded),
+        "dailyPrefix": daily_prefix,
+        "objects": uploaded,
+    }
+    if args.cleanup and not args.dataset_dir:
+        shutil.rmtree(staging, ignore_errors=True)
     print(json.dumps(result, indent=2))
     return 0
 
@@ -660,6 +757,8 @@ def cmd_process_portraits(args: argparse.Namespace) -> int:
             "schema_version": 1,
             "vodId": vod_id,
             "created_at": datetime.now(timezone.utc).isoformat(),
+            "intro": str(args.intro),
+            "outro": bool(args.outro),
             "still_seconds": float(args.still_seconds),
             "still_mode": str(args.still_mode),
             "game_mode": str(args.game_mode),
@@ -709,10 +808,12 @@ def cmd_process_portraits(args: argparse.Namespace) -> int:
             str(out_mp4),
             "--preview-frame",
             str(preview),
-            "--still-seconds",
-            str(args.still_seconds),
-            "--still-mode",
-            str(args.still_mode),
+            "--intro",
+            str(args.intro),
+            "--overlay-hold",
+            str(args.overlay_hold),
+            "--end-seconds",
+            str(args.end_seconds),
             "--game-mode",
             str(args.game_mode),
             "--game-zoom",
@@ -724,6 +825,18 @@ def cmd_process_portraits(args: argparse.Namespace) -> int:
             "--crf",
             str(args.crf),
         ]
+        if args.outro:
+            cmd.append("--outro")
+        else:
+            cmd.append("--no-outro")
+        if str(args.intro) == "story":
+            still = float(args.still_seconds) if float(args.still_seconds) > 0 else 3.0
+            cmd += [
+                "--still-seconds",
+                str(still),
+                "--still-mode",
+                str(args.still_mode),
+            ]
         if args.kda_overlay:
             cmd.append("--kda-overlay")
         else:
@@ -754,10 +867,18 @@ def cmd_process_portraits(args: argparse.Namespace) -> int:
                 "--track-outside-hold",
                 str(args.track_outside_hold),
             ]
+        cmd += [
+            "--music",
+            str(args.music),
+            "--music-db",
+            str(args.music_db),
+        ]
         print(
             f"[portrait] {weave.name} → {out_mp4.name} "
-            f"(still={args.still_mode} zoom={args.game_zoom} "
+            f"(intro={args.intro} outro={'on' if args.outro else 'off'} "
+            f"zoom={args.game_zoom} "
             f"track={'on' if args.track_champion else 'off'} "
+            f"music={args.music} "
             f"preset={args.preset} crf={args.crf})",
             flush=True,
         )
@@ -1849,7 +1970,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--min-clips",
         type=int,
         default=2,
-        help="Skip games with fewer than N clips (default: 2)",
+        help="Skip games with fewer than N clips after ranking (default: 2)",
+    )
+    p_clips.add_argument(
+        "--top-k",
+        type=int,
+        default=5,
+        help="Rank clips and stitch only the best N per game (default: 5). 0 = all.",
+    )
+    p_clips.add_argument(
+        "--no-rank",
+        action="store_true",
+        help="Skip ranking; stitch every KDA clip (old behavior).",
     )
     p_clips.add_argument(
         "--clips-subdir",
@@ -1882,6 +2014,54 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p_clips.set_defaults(func=cmd_process_clips)
 
+    p_daily = sub.add_parser(
+        "process-daily",
+        help="Rank every clip from every VOD on a day and stitch one daily compilation",
+    )
+    p_daily.add_argument(
+        "--day-key",
+        default=None,
+        help="Archive day, e.g. aug12_2026 (America/New_York). Or pass --vod-id.",
+    )
+    p_daily.add_argument(
+        "--vod-id",
+        default=None,
+        help="Derive --day-key from this VOD's archive folder",
+    )
+    p_daily.add_argument(
+        "--dataset-dir",
+        type=Path,
+        default=None,
+        help="Local folder that already contains lol_clips (possibly nested by vod id)",
+    )
+    p_daily.add_argument("--work-dir", type=Path, default=None)
+    p_daily.add_argument(
+        "--top-k",
+        type=int,
+        default=12,
+        help="Keep the best N clips from the whole day (default: 12)",
+    )
+    p_daily.add_argument(
+        "--max-per-game",
+        type=int,
+        default=3,
+        help="Max clips from one game (default: 3). 0 = no cap",
+    )
+    p_daily.add_argument(
+        "--order",
+        choices=("chrono", "score"),
+        default="chrono",
+        help="Clip order in the daily file (default: chrono)",
+    )
+    p_daily.add_argument(
+        "--upload",
+        action="store_true",
+        help="Upload even when using --dataset-dir",
+    )
+    p_daily.add_argument("--clean-work", action="store_true")
+    p_daily.add_argument("--cleanup", action="store_true")
+    p_daily.set_defaults(func=cmd_process_daily)
+
     p_port = sub.add_parser(
         "process-portraits",
         help=(
@@ -1904,16 +2084,40 @@ def build_parser() -> argparse.ArgumentParser:
         help="Only render the first N weaves (0 = all). Useful for a single-game test.",
     )
     p_port.add_argument(
+        "--intro",
+        choices=("overlay", "story", "none"),
+        default="overlay",
+        help="Opening: overlay on gameplay (default), story=deprecated lobby card, none",
+    )
+    p_port.add_argument(
+        "--outro",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Append the rank-card end outro (default: on)",
+    )
+    p_port.add_argument(
+        "--overlay-hold",
+        type=float,
+        default=2.0,
+        help="Seconds the overlay intro stays up (default: 2)",
+    )
+    p_port.add_argument(
+        "--end-seconds",
+        type=float,
+        default=2.5,
+        help="Rank-card outro length (default: 2.5)",
+    )
+    p_port.add_argument(
         "--still-seconds",
         type=float,
-        default=3.0,
-        help="Lobby still at start (no facecam split); default 3",
+        default=0.0,
+        help="Deprecated. Only used with --intro story (lobby still length)",
     )
     p_port.add_argument(
         "--still-mode",
         choices=("story", "champs", "contain", "cover"),
         default="story",
-        help="Lobby intro (default: story = animated camera)",
+        help="Deprecated lobby intro crop. Only used with --intro story",
     )
     p_port.add_argument(
         "--game-mode",
@@ -1924,8 +2128,8 @@ def build_parser() -> argparse.ArgumentParser:
     p_port.add_argument(
         "--game-zoom",
         type=float,
-        default=1.0,
-        help="Crop zoom: 1.0=tight, 0.7/0.5=zoom out, 0=full-frame fit",
+        default=0.65,
+        help="Crop zoom: 1.0=tight, 0.65=wider + blur bars (default), 0=full-frame fit",
     )
     p_port.add_argument(
         "--cam-hole",
@@ -1950,9 +2154,15 @@ def build_parser() -> argparse.ArgumentParser:
     p_port.add_argument("--track-ease-ms", type=float, default=280.0)
     p_port.add_argument("--track-max-speed", type=float, default=860.0)
     p_port.add_argument("--track-self-bias", type=float, default=0.50)
-    p_port.add_argument("--track-enemy-pull", type=float, default=0.45)
-    p_port.add_argument("--track-pan-cooldown", type=float, default=0.7)
-    p_port.add_argument("--track-outside-hold", type=float, default=0.12)
+    p_port.add_argument("--track-enemy-pull", type=float, default=0.0)
+    p_port.add_argument("--track-pan-cooldown", type=float, default=3.0)
+    p_port.add_argument("--track-outside-hold", type=float, default=1.5)
+    p_port.add_argument(
+        "--music",
+        default="auto",
+        help="Lofi bed: auto=random catalog pick (default), off, or catalog id",
+    )
+    p_port.add_argument("--music-db", type=float, default=-20.0)
     p_port.add_argument("--preset", default="veryfast", help="x264 preset (default: veryfast)")
     p_port.add_argument("--crf", type=int, default=20)
     p_port.add_argument(

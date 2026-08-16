@@ -1,0 +1,16 @@
+{
+  "streamers": [
+    {
+      "id": "doublelift",
+      "display": "Doublelift",
+      "names": ["doublelift"],
+      "tags": ["na01", "na1"]
+    },
+    {
+      "id": "aidenyasuo",
+      "display": "AidenYasuo",
+      "names": ["aiden yasuo", "ankara aiden"],
+      "tags": ["messi"]
+    }
+  ]
+}

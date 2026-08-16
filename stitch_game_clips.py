@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Weave per-game LoL clips into one compilation video per game folder.
 
+Ranks clips and keeps the top K per game (default 5) unless --top-k 0.
 Optionally prepends a lobby-card intro (default 3s) generated from Riot ranks.
 """
 
@@ -43,6 +44,117 @@ def discover_games(clips_dir: Path) -> list[tuple[str, list[Path]]]:
         if clips:
             games.append((folder.name, clips))
     return games
+
+
+def apply_top_k(
+    games: list[tuple[str, list[Path]]],
+    *,
+    dataset_dir: Path,
+    clips_dir: Path,
+    top_k: int,
+    extra_dirs: list[Path] | None = None,
+) -> tuple[list[tuple[str, list[Path]]], dict[str, Any]]:
+    """Rank clips and keep the best top_k per game, still in chrono order."""
+    from score_clips import pick_top_k, rank_dataset, write_rank_outputs
+
+    scored = rank_dataset(dataset_dir, clips_dir)
+    if not scored:
+        return games, {"top_k": top_k, "picked": 0, "scored": 0}
+    picks = pick_top_k(scored, top_k, per_game=True)
+    write_rank_outputs(
+        dataset_dir=dataset_dir,
+        clips_dir=clips_dir,
+        scored=scored,
+        picks=picks,
+        top_k=top_k,
+        extra_dirs=extra_dirs,
+        per_game=True,
+        scope="game",
+    )
+    keep_by_folder: dict[str, set[str]] = {}
+    for clip in picks:
+        folder = str(clip.get("gameFolder") or Path(clip["relativePath"]).parent.name)
+        keep_by_folder.setdefault(folder, set()).add(Path(clip["relativePath"]).name)
+
+    filtered: list[tuple[str, list[Path]]] = []
+    for folder, clips in games:
+        names = keep_by_folder.get(folder)
+        if not names:
+            print(f"[rank] {folder}: no picks, skipping", flush=True)
+            continue
+        kept = [p for p in clips if p.name in names]
+        print(
+            f"[rank] {folder}: {len(clips)} → {len(kept)} (top {top_k})",
+            flush=True,
+        )
+        if kept:
+            filtered.append((folder, kept))
+    return filtered, {
+        "top_k": top_k,
+        "scored": len(scored),
+        "picked": len(picks),
+        "files": [c.get("relativePath") for c in picks],
+        "scope": "game",
+        "per_game": True,
+    }
+
+
+def apply_daily_top_k(
+    *,
+    dataset_dir: Path,
+    clips_dir: Path,
+    top_k: int,
+    max_per_game: int,
+    order: str,
+    extra_dirs: list[Path] | None = None,
+) -> tuple[list[Path], dict[str, Any]]:
+    """Rank every clip under clips_dir and return the daily slate as paths."""
+    from score_clips import pick_top_k, rank_dataset, write_rank_outputs
+
+    scored = rank_dataset(dataset_dir, clips_dir)
+    if not scored:
+        return [], {"top_k": top_k, "picked": 0, "scored": 0, "scope": "daily"}
+    picks = pick_top_k(
+        scored,
+        top_k,
+        per_game=False,
+        max_per_game=max_per_game,
+        order=order,
+    )
+    write_rank_outputs(
+        dataset_dir=dataset_dir,
+        clips_dir=clips_dir,
+        scored=scored,
+        picks=picks,
+        top_k=top_k,
+        extra_dirs=extra_dirs,
+        per_game=False,
+        max_per_game=max_per_game,
+        scope="daily",
+    )
+    paths = [Path(c["path"]) for c in picks if Path(c["path"]).is_file()]
+    print(
+        f"[rank] daily: {len(scored)} clips → {len(paths)} "
+        f"(top {top_k}, max {max_per_game}/game, order={order})",
+        flush=True,
+    )
+    for clip in picks:
+        print(
+            f"  #{clip.get('rank')}  {float(clip.get('score') or 0):.2f}  "
+            f"{clip.get('relativePath')}",
+            flush=True,
+        )
+    return paths, {
+        "top_k": top_k,
+        "max_per_game": max_per_game,
+        "order": order,
+        "scored": len(scored),
+        "picked": len(paths),
+        "files": [c.get("relativePath") for c in picks],
+        "scope": "daily",
+        "per_game": False,
+        "enabled": True,
+    }
 
 
 def games_from_manifest(clips_dir: Path, manifest: dict[str, Any]) -> list[tuple[str, list[Path]]]:
@@ -556,7 +668,35 @@ def build_parser() -> argparse.ArgumentParser:
         "--min-clips",
         type=int,
         default=2,
-        help="Skip games with fewer than N clips (default: 2)",
+        help="Skip games with fewer than N clips after ranking (default: 2)",
+    )
+    p.add_argument(
+        "--top-k",
+        type=int,
+        default=5,
+        help="Rank clips and stitch only the best N per game (default: 5). 0 = all clips.",
+    )
+    p.add_argument(
+        "--no-rank",
+        action="store_true",
+        help="Skip ranking; stitch every clip in each game folder.",
+    )
+    p.add_argument(
+        "--daily",
+        action="store_true",
+        help="One compilation from the top clips across every game (not per-game weaves).",
+    )
+    p.add_argument(
+        "--max-per-game",
+        type=int,
+        default=3,
+        help="With --daily, max clips from one game (default: 3). 0 = no cap.",
+    )
+    p.add_argument(
+        "--order",
+        choices=("chrono", "score"),
+        default="chrono",
+        help="With --daily, clip order (default: chrono).",
     )
     p.add_argument("--force", action="store_true", help="Overwrite existing weaves")
     p.add_argument(
@@ -611,12 +751,77 @@ def main(argv: list[str] | None = None) -> int:
         print(f"error: missing clips dir {clips_dir}", file=sys.stderr)
         return 1
 
+    if args.daily:
+        k = int(args.top_k) if int(args.top_k) > 0 else 12
+        if args.no_rank:
+            print("error: --daily requires ranking (omit --no-rank)", file=sys.stderr)
+            return 2
+        out_dir.mkdir(parents=True, exist_ok=True)
+        paths, rank_meta = apply_daily_top_k(
+            dataset_dir=dataset_dir,
+            clips_dir=clips_dir,
+            top_k=k,
+            max_per_game=int(args.max_per_game),
+            order=str(args.order),
+            extra_dirs=[out_dir],
+        )
+        if len(paths) < max(1, int(args.min_clips)):
+            print(f"error: daily slate has {len(paths)} clip(s)", file=sys.stderr)
+            return 1
+        output = out_dir / f"daily_top{k}.mp4"
+        if output.exists() and not args.force:
+            print(f"[skip] exists {output.name} (pass --force)", file=sys.stderr)
+            return 0
+        probe = probe_video(paths[0])
+        print(f"[stitch] daily × {len(paths)} → {output.name}", flush=True)
+        info = stitch_one(
+            paths,
+            output,
+            reencode=bool(args.reencode),
+            width=int(probe["width"]),
+            height=int(probe["height"]),
+            fps=float(probe["fps"]),
+            trim_lead=float(args.trim_lead),
+            trim_trail=float(args.trim_trail),
+            detect_freeze=bool(args.detect_freeze),
+        )
+        report = {
+            "schema_version": 2,
+            "dataset_id": dataset_dir.name,
+            "created_at": datetime.now(timezone.utc).isoformat(),
+            "scope": "daily",
+            "rank": rank_meta,
+            "output": str(output),
+            "filename": output.name,
+            "clipCount": len(paths),
+            "sources": [p.name for p in paths],
+            "mode": info.get("mode"),
+        }
+        (out_dir / "compilations.json").write_text(
+            json.dumps(report, indent=2, ensure_ascii=False) + "\n",
+            encoding="utf-8",
+        )
+        print(json.dumps({"status": "ok", **{k: report[k] for k in ("filename", "clipCount", "scope")}}, indent=2))
+        return 0
+
     manifest_path = clips_dir / "clips.json"
     manifest = load_json(manifest_path) if manifest_path.is_file() else None
     if manifest is not None:
         games = games_from_manifest(clips_dir, manifest)
     else:
         games = discover_games(clips_dir)
+
+    rank_meta: dict[str, Any] = {"top_k": 0, "enabled": False}
+    top_k = 0 if args.no_rank else int(args.top_k)
+    if top_k > 0:
+        games, rank_meta = apply_top_k(
+            games,
+            dataset_dir=dataset_dir,
+            clips_dir=clips_dir,
+            top_k=top_k,
+            extra_dirs=[out_dir],
+        )
+        rank_meta["enabled"] = True
 
     if want_lobby and not os.environ.get("RIOT_API_KEY", "").strip():
         print(
@@ -680,7 +885,7 @@ def main(argv: list[str] | None = None) -> int:
                     lobby_png = out_dir / f"{Path(weave_name).stem}_lobby.png"
                     print(f"[lobby] {folder} match={match_id}", flush=True)
                     generate_lobby_png(match_id, lobby_png)
-                    # PNG only — no lobby mp4 encode. Portrait builds the 3s intro.
+                    # PNG + meta only — no lobby mp4. Portrait burns the overlay intro.
                     stitch_clips = list(clips)
                     lobby_meta = {
                         "included": True,
@@ -721,6 +926,7 @@ def main(argv: list[str] | None = None) -> int:
         "trim_lead": float(args.trim_lead),
         "trim_trail": float(args.trim_trail),
         "detect_freeze": bool(args.detect_freeze),
+        "rank": rank_meta,
         "game_count": len(weaves),
         "weaves": weaves,
     }
@@ -733,6 +939,8 @@ def main(argv: list[str] | None = None) -> int:
                 "output_dir": str(out_dir),
                 "game_count": len(weaves),
                 "lobby_seconds": report["lobby_seconds"],
+                "top_k": rank_meta.get("top_k") or 0,
+                "ranked_clips": rank_meta.get("files") or [],
                 "weaves": [w.get("filename") for w in weaves],
             },
             indent=2,

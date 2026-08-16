@@ -1,0 +1,47 @@
+{
+  "source": "mixkit",
+  "license_policy": "Mixkit Stock Music Free License (YouTube-safe, no attribution required)",
+  "license": "https://mixkit.co/license/#musicFree",
+  "tracks": [
+    {
+      "id": "digital-clouds",
+      "name": "Digital Clouds",
+      "artist": "Alejandro Magaña (A. M.)",
+      "genre": "Chillout",
+      "duration": "1:41",
+      "mixkit_id": 175,
+      "url": "https://assets.mixkit.co/music/175/175.mp3",
+      "page": "https://mixkit.co/free-stock-music/chillout/"
+    },
+    {
+      "id": "sweet-september",
+      "name": "Sweet September",
+      "artist": "Arulo",
+      "genre": "Lo-Fi / Hip Hop",
+      "duration": "1:39",
+      "mixkit_id": 282,
+      "url": "https://assets.mixkit.co/music/282/282.mp3",
+      "page": "https://mixkit.co/free-stock-music/lo-fi-beats/"
+    },
+    {
+      "id": "a-blue-day",
+      "name": "A Blue Day",
+      "artist": "Alejandro Magaña (A. M.)",
+      "genre": "Chillout",
+      "duration": "3:20",
+      "mixkit_id": 150,
+      "url": "https://assets.mixkit.co/music/150/150.mp3",
+      "page": "https://mixkit.co/free-stock-music/chillout/"
+    },
+    {
+      "id": "sleepy-cat",
+      "name": "Sleepy Cat",
+      "artist": "Alejandro Magaña (A. M.)",
+      "genre": "Chillout",
+      "duration": "1:59",
+      "mixkit_id": 135,
+      "url": "https://assets.mixkit.co/music/135/135.mp3",
+      "page": "https://mixkit.co/free-stock-music/lo-fi-beats/"
+    }
+  ]
+}

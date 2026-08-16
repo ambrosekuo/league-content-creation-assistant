@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Archive viewer</title>
+  <link rel="stylesheet" href="/static/styles.css" />
+</head>
+<body>
+  <header class="top">
+    <div class="brand">
+      <span class="mark">▣</span>
+      <div>
+        <h1>Archive</h1>
+        <p id="source-line">loading…</p>
+      </div>
+    </div>
+    <div class="top-actions">
+      <button type="button" id="btn-refresh" class="ghost">Refresh</button>
+    </div>
+  </header>
+
+  <div class="shell">
+    <aside class="nav">
+      <div id="day-list" class="day-list"></div>
+    </aside>
+
+    <main class="stage">
+      <section class="player-wrap" id="player-wrap">
+        <div class="player-frame" data-kind="portrait">
+          <video id="player" controls playsinline></video>
+          <div class="player-empty" id="player-empty">Pick a video</div>
+        </div>
+        <div class="now">
+          <h2 id="now-title">No VOD selected</h2>
+          <p id="now-meta" class="muted"></p>
+          <p id="now-file" class="mono"></p>
+        </div>
+      </section>
+
+      <section class="library">
+        <div class="lib-bar">
+          <div class="chips" id="kind-chips"></div>
+          <span id="lib-count" class="muted"></span>
+        </div>
+        <div id="grid" class="grid"></div>
+      </section>
+    </main>
+
+    <aside class="rail">
+      <section>
+        <h3>Requeue</h3>
+        <label class="row-label">Run on</label>
+        <div class="seg" id="where-seg">
+          <button type="button" data-where="cloud" class="on">Cloud Run</button>
+          <button type="button" data-where="local">Local</button>
+        </div>
+        <div id="job-list" class="job-list"></div>
+        <label class="row-label" for="extra-args">Extra args</label>
+        <input id="extra-args" type="text" placeholder="--top-k 8 --track-outside-hold 2" />
+        <pre id="job-out" class="job-out hidden"></pre>
+      </section>
+
+      <section>
+        <h3>Notes</h3>
+        <textarea id="notes" rows="6" placeholder="Edit notes for this VOD…"></textarea>
+        <p id="notes-status" class="muted"></p>
+      </section>
+
+      <section>
+        <h3>Selected file</h3>
+        <div class="file-actions">
+          <button type="button" id="btn-keep">Keep</button>
+          <button type="button" id="btn-skip">Skip</button>
+          <button type="button" id="btn-pull" class="ghost">Pull from GCS</button>
+          <button type="button" id="btn-delete" class="danger ghost">Delete local</button>
+        </div>
+        <p class="hint">Keys: j/k next · 1 keep · 2 skip · space play</p>
+      </section>
+    </aside>
+  </div>
+  <script src="/static/app.js"></script>
+</body>
+</html>

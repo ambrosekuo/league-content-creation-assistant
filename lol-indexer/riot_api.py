@@ -196,6 +196,55 @@ class RiotAPI:
             self.base_url = original
         return list(result or [])
 
+    def get_challenger_league(
+        self,
+        *,
+        queue: str = "RANKED_SOLO_5x5",
+        platform: str = "na1",
+    ) -> dict[str, Any]:
+        """Platform routing. Full Challenger ladder for a queue."""
+        path = f"/lol/league/v4/challengerleagues/by-queue/{queue}"
+        original = self.base_url
+        self.base_url = f"https://{platform.strip().lower()}.api.riotgames.com"
+        try:
+            result = self._request(path)
+        finally:
+            self.base_url = original
+        return dict(result or {})
+
+    def get_grandmaster_league(
+        self,
+        *,
+        queue: str = "RANKED_SOLO_5x5",
+        platform: str = "na1",
+    ) -> dict[str, Any]:
+        path = f"/lol/league/v4/grandmasterleagues/by-queue/{queue}"
+        original = self.base_url
+        self.base_url = f"https://{platform.strip().lower()}.api.riotgames.com"
+        try:
+            result = self._request(path)
+        finally:
+            self.base_url = original
+        return dict(result or {})
+
+    def get_league_exp_page(
+        self,
+        *,
+        queue: str = "RANKED_SOLO_5x5",
+        tier: str = "CHALLENGER",
+        division: str = "I",
+        page: int = 1,
+        platform: str = "na1",
+    ) -> list[dict[str, Any]]:
+        path = f"/lol/league-exp/v4/entries/{queue}/{tier}/{division}"
+        original = self.base_url
+        self.base_url = f"https://{platform.strip().lower()}.api.riotgames.com"
+        try:
+            result = self._request(path, {"page": page})
+        finally:
+            self.base_url = original
+        return list(result or [])
+
 
 def _parse_retry_after(value: str | None) -> float | None:
     if value is None:

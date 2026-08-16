@@ -1,0 +1,63 @@
+{
+  "license_policy": "Creative Commons 0 only",
+  "duration": [0.15, 2.5],
+  "sort": "downloads_desc",
+  "per_slot": 2,
+  "slots": [
+    {
+      "id": "register",
+      "label": "Cash register",
+      "use_on": "kill / outplay reward (your current pick)",
+      "queries": ["cash register", "cha ching", "kaching"]
+    },
+    {
+      "id": "coin",
+      "label": "Coin collect",
+      "use_on": "single clean kill",
+      "queries": ["coin", "coin collect", "gold coin"]
+    },
+    {
+      "id": "jackpot",
+      "label": "Jackpot / slots",
+      "use_on": "multi-kill, baron",
+      "queries": ["slot machine payout", "jackpot win", "casino coins"]
+    },
+    {
+      "id": "levelup",
+      "label": "Level-up chime",
+      "use_on": "oneshot / outplay",
+      "queries": ["level up", "power up", "success chime"]
+    },
+    {
+      "id": "sparkle",
+      "label": "Sparkle",
+      "use_on": "oneshot, ability hit",
+      "queries": ["magic sparkle", "twinkle", "chime sparkle"]
+    },
+    {
+      "id": "ding",
+      "label": "UI ding",
+      "use_on": "short confirm on a kill",
+      "queries": ["ui success", "notification ding", "achievement"]
+    },
+    {
+      "id": "loss",
+      "label": "Negative LP",
+      "use_on": "end card on a loss / LP drop",
+      "queries": [
+        "game fail",
+        "life lost",
+        "power down",
+        "descending arpeggio",
+        "negative beeps",
+        "cartoon fall"
+      ]
+    },
+    {
+      "id": "intro",
+      "label": "Modern intro",
+      "use_on": "clip / weave open",
+      "queries": ["awkward tag", "cartoon sting", "kazoo fanfare", "cute wiggle", "cartoon magic transition"]
+    }
+  ]
+}

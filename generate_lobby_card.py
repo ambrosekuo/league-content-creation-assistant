@@ -21,6 +21,7 @@ from riot_api import RiotAPI, RiotAPIError
 
 CDRAGON = "https://raw.communitydragon.org/latest/plugins/rcp-fe-lol-static-assets/global/default"
 DDRAGON_LOADING = "https://ddragon.leagueoflegends.com/cdn/img/champion/loading"
+DDRAGON_SPLASH = "https://ddragon.leagueoflegends.com/cdn/img/champion/splash"
 
 ROLE_ORDER = ["TOP", "JUNGLE", "MIDDLE", "BOTTOM", "UTILITY"]
 ROLE_LABELS = {
@@ -190,11 +191,64 @@ def open_rgba(data: bytes):
     return Image.open(io.BytesIO(data)).convert("RGBA")
 
 
-def loading_splash(champ: str):
+def loading_splash(champ: str, skin: int = 0):
     key = champ_key(champ)
-    data = cached_bytes(f"{DDRAGON_LOADING}/{key}_0.jpg")
+    data = cached_bytes(f"{DDRAGON_LOADING}/{key}_{int(skin)}.jpg")
+    if not data and skin:
+        data = cached_bytes(f"{DDRAGON_LOADING}/{key}_0.jpg")
     if not data:
         return None
+    return open_rgba(data)
+
+
+def champion_splash(champ: str, skin: int = 0):
+    key = champ_key(champ)
+    data = cached_bytes(f"{DDRAGON_SPLASH}/{key}_{int(skin)}.jpg")
+    if not data and skin:
+        data = cached_bytes(f"{DDRAGON_SPLASH}/{key}_0.jpg")
+    if not data:
+        return None
+    return open_rgba(data)
+
+
+def ddragon_version() -> str:
+    data = cached_bytes("https://ddragon.leagueoflegends.com/api/versions.json")
+    if not data:
+        return "15.16.1"
+    try:
+        versions = json.loads(data.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return "15.16.1"
+    if isinstance(versions, list) and versions:
+        return str(versions[0])
+    return "15.16.1"
+
+
+def champion_icon(champ: str):
+    """Square champion icon (Data Dragon), or None if missing."""
+    key = champ_key(champ)
+    if not key or key in {"?", "Unknown", ""}:
+        return None
+    data = cached_bytes(f"https://cdn.communitydragon.org/latest/champion/{key}/square")
+    if not data:
+        ver = ddragon_version()
+        data = cached_bytes(f"https://ddragon.leagueoflegends.com/cdn/{ver}/img/champion/{key}.png")
+    if not data:
+        return None
+    return open_rgba(data)
+
+
+def champion_tile(champ: str, skin: int = 0):
+    """Loading-screen tile for a skin (e.g. Bewitching LeBlanc = 45)."""
+    key = champ_key(champ)
+    if not key or key in {"?", "Unknown", ""}:
+        return None
+    skin_n = int(skin or 0)
+    data = cached_bytes(f"https://ddragon.leagueoflegends.com/cdn/img/champion/tiles/{key}_{skin_n}.jpg")
+    if not data and skin_n:
+        data = cached_bytes(f"https://ddragon.leagueoflegends.com/cdn/img/champion/tiles/{key}_0.jpg")
+    if not data:
+        return champion_icon(champ)
     return open_rgba(data)
 
 

@@ -12,9 +12,9 @@ Layout (default):
 
 Calibrate --cam-* / --kda-* once from a mid-frame; both are assumed static.
 
-For weaves with a lobby-card intro, pass --still-seconds 3 so the opening
-is shown without the facecam split. Default --still-mode story plays the
-animated lobby intro (full lobby → you vs lane opponent) then smash-cuts to gameplay.
+Default intro is a 2s road-to-Challenger overlay on the first gameplay
+seconds (plus sparkle sting), then the rank-card outro after the weave.
+The old lobby story (--intro story --still-seconds 3) is kept but unused.
 """
 
 from __future__ import annotations
@@ -309,12 +309,11 @@ def gameplay_crop_box(
         max(tight_w, int(round(tight_w + (src_w - tight_w) * (1.0 - zoom))))
     )
     game_crop_w = even(min(src_w, max(2, game_crop_w)))
-    # Keep the 9:16 window inside the map art. Facecam sits in the
-    # bottom-right, but fights often happen above it — allow the crop
-    # to slide right far enough to keep a nearby enemy on screen.
+    # Keep a little left margin so HUD/rank overlay isn't the crop edge.
+    # No right pad — river brush / far laner sit on the right of mid and
+    # were getting clipped. Landscape facecam may peek in the corner.
     min_x = even(max(0, int(round(src_w * 0.08))))
-    right_pad = even(max(16, int(round(src_w * 0.055))))
-    max_x = even(max(0, src_w - game_crop_w - right_pad))
+    max_x = even(max(0, src_w - game_crop_w))
     if max_x < min_x:
         min_x = max_x
     center_x = max(0, (src_w - game_crop_w) // 2)
@@ -334,6 +333,26 @@ def gameplay_crop_box(
         "cam_w": cam_w,
         "cam_h": cam_h,
     }
+
+
+def contain_pad_top(src_w: int, src_h: int, dst_w: int, dst_h: int) -> int:
+    """Top pad in pixels when containing src into dst (decrease + center)."""
+    scale = min(dst_w / max(src_w, 1), dst_h / max(src_h, 1))
+    fit_h = even(max(2, int(round(src_h * scale))))
+    fit_h = min(fit_h, dst_h)
+    return max(0, (dst_h - fit_h) // 2)
+
+
+def contain_with_blur_vf(dst_w: int, dst_h: int) -> str:
+    """Fit into dst; fill empty bands with a blurred cover crop of the same frame."""
+    return (
+        f"split=2[gbg][gfg];"
+        f"[gbg]scale={dst_w}:{dst_h}:force_original_aspect_ratio=increase,"
+        f"crop={dst_w}:{dst_h},"
+        f"boxblur=22:6[gblur];"
+        f"[gfg]scale={dst_w}:{dst_h}:force_original_aspect_ratio=decrease[gfit];"
+        f"[gblur][gfit]overlay=(W-w)/2:(H-h)/2,setsar=1"
+    )
 
 
 def cam_hole_prefix(
@@ -380,15 +399,18 @@ def cam_stack_parts(
     crop_x: int | None = None,
     sendcmd_path: Path | None = None,
     cam_hole: str = "fill",
-) -> tuple[str, str, int, int]:
-    """Return (cam_vf, game_vf, top_h, bot_h) for the facecam stack.
+) -> tuple[str, str, int, int, int]:
+    """Return (cam_vf, game_vf, top_h, bot_h, kda_y) for the facecam stack.
+
+    kda_y is the top of the *visible* gameplay (below any letterbox pad) so
+    the scoreboard PIP sits on the video, not on the fill.
 
     game_mode:
       crop — vertical center crop (zoomed action)
       fit  — scale full 16:9 HUD into the game pane
 
     game_zoom (crop mode only):
-      1.0 = tight fill (current). Lower = zoom out toward full frame width
+      1.0 = tight fill. Lower = zoom out toward full frame width
       (0.0 ≈ use full source width, letterbox/pillar as needed via scale).
     """
     out_w = even(out_w)
@@ -412,12 +434,8 @@ def cam_stack_parts(
     zoom = max(0.0, min(1.0, float(game_zoom)))
 
     if mode == "fit" or zoom <= 0.0:
-        game_vf = (
-            f"{hole}"
-            f"scale={out_w}:{bot_h}:force_original_aspect_ratio=decrease,"
-            f"pad={out_w}:{bot_h}:(ow-iw)/2:(oh-ih)/2:color=0x0A0C12,"
-            f"setsar=1"
-        )
+        game_vf = f"{hole}{contain_with_blur_vf(out_w, bot_h)}"
+        kda_y = contain_pad_top(src_w, src_h, out_w, bot_h)
     else:
         box = gameplay_crop_box(
             src_w=src_w,
@@ -433,12 +451,8 @@ def cam_stack_parts(
             game_zoom=zoom,
         )
         if box is None:
-            game_vf = (
-                f"{hole}"
-                f"scale={out_w}:{bot_h}:force_original_aspect_ratio=decrease,"
-                f"pad={out_w}:{bot_h}:(ow-iw)/2:(oh-ih)/2:color=0x0A0C12,"
-                f"setsar=1"
-            )
+            game_vf = f"{hole}{contain_with_blur_vf(out_w, bot_h)}"
+            kda_y = contain_pad_top(src_w, src_h, out_w, bot_h)
         else:
             game_x = box["crop_x"] if crop_x is None else int(crop_x)
             game_x = max(0, min(even(game_x), src_w - box["crop_w"]))
@@ -451,13 +465,9 @@ def cam_stack_parts(
                     f"crop@game={box['crop_w']}:{box['crop_h']}:{game_x}:{box['crop_y']}"
                 )
             if box.get("scale_fill"):
-                game_vf = (
-                    f"{hole}"
-                    f"{crop},"
-                    f"scale={out_w}:{bot_h}:force_original_aspect_ratio=increase,"
-                    f"crop={out_w}:{bot_h},"
-                    f"setsar=1"
-                )
+                # Wider-than-pane crop: letterbox so extra width stays visible.
+                game_vf = f"{hole}{crop},{contain_with_blur_vf(out_w, bot_h)}"
+                kda_y = contain_pad_top(box["crop_w"], box["crop_h"], out_w, bot_h)
             else:
                 game_vf = (
                     f"{hole}"
@@ -465,7 +475,8 @@ def cam_stack_parts(
                     f"scale={out_w}:{bot_h},"
                     f"setsar=1"
                 )
-    return cam_vf, game_vf, top_h, bot_h
+                kda_y = 0
+    return cam_vf, game_vf, top_h, bot_h, kda_y
 
 
 def build_filter(
@@ -506,7 +517,7 @@ def build_filter(
     kda_x, kda_y, kda_w, kda_h = scale_box(
         kda_x, kda_y, kda_w, kda_h, src_w=src_w, src_h=src_h
     )
-    cam_vf, game_vf, top_h, _bot_h = cam_stack_parts(
+    cam_vf, game_vf, top_h, _bot_h, kda_ov_y = cam_stack_parts(
         src_w=src_w,
         src_h=src_h,
         cam_w=cam_w,
@@ -531,9 +542,8 @@ def build_filter(
     kda_y = max(0, min(kda_y, src_h - kda_h))
     kda_out_w = even(max(2, min(kda_out_w, out_w - 2 * max(kda_margin, 0))))
     kda_out_h = even(max(2, int(round(kda_out_w * kda_h / max(kda_w, 1)))))
-    # Flush to top-right of the full portrait frame (right edge of HUD = right edge of video)
-    ov_x = out_w - kda_out_w - max(0, kda_margin)
-    ov_y = top_h + max(0, kda_margin)
+    # Top-right of the visible gameplay (not the letterbox fill / not the facecam seam)
+    kda_ov_y = int(kda_ov_y) + max(0, kda_margin)
 
     # Tight crop only — no plate/border
     kda_vf = (
@@ -543,19 +553,19 @@ def build_filter(
     )
 
     def stack_with_optional_kda(split_n: int, cam_label: str, game_label: str, kda_label: str | None) -> str:
-        """cam+game vstack, optionally overlay KDA PIP → [v] or intermediate."""
+        """cam+game vstack, optionally overlay KDA PIP on the gameplay video."""
         body = (
             f"[{cam_label}]{cam_vf}[cam];"
             f"[{game_label}]{game_vf}[game];"
-            f"[cam][game]vstack=inputs=2[base]"
         )
         if kda_overlay and kda_label:
             body += (
-                f";[{kda_label}]{kda_vf}[kda];"
-                f"[base][kda]overlay=x=main_w-overlay_w-{max(0, kda_margin)}:y={ov_y}:format=auto,format=yuv420p[v]"
+                f"[{kda_label}]{kda_vf}[kda];"
+                f"[game][kda]overlay=x=main_w-overlay_w-{max(0, kda_margin)}:y={kda_ov_y}:format=auto[gk];"
+                f"[cam][gk]vstack=inputs=2,format=yuv420p[v]"
             )
         else:
-            body += ",format=yuv420p[v]"
+            body += f"[cam][game]vstack=inputs=2,format=yuv420p[v]"
         return body
 
     if still_s <= 0:
@@ -575,9 +585,9 @@ def build_filter(
             f"{play_head}trim=start={skip_s:.3f},setpts=PTS-STARTPTS,split=3[cam_src][game_src][kda_src];"
             f"[cam_src]{cam_vf}[cam];"
             f"[game_src]{game_vf}[game];"
-            f"[cam][game]vstack=inputs=2[base];"
             f"[kda_src]{kda_vf}[kda];"
-            f"[base][kda]overlay=x=main_w-overlay_w-{max(0, kda_margin)}:y={ov_y}:format=auto,format=yuv420p[play]"
+            f"[game][kda]overlay=x=main_w-overlay_w-{max(0, kda_margin)}:y={kda_ov_y}:format=auto[gk];"
+            f"[cam][gk]vstack=inputs=2,format=yuv420p[play]"
         )
     else:
         play = (
@@ -630,7 +640,7 @@ def render_portrait(
     lobby_png: Path | None = None,
     lobby_meta: Path | None = None,
     game_mode: str = "crop",
-    game_zoom: float = 1.0,
+    game_zoom: float = 0.65,
     cam_hole: str = "fill",
     kda_overlay: bool = True,
     kda_x: int = 1316,
@@ -650,11 +660,31 @@ def render_portrait(
     track_ease_ms: float = 280.0,
     track_max_speed: float = 860.0,
     track_self_bias: float = 0.50,
-    track_enemy_pull: float = 0.45,
-    track_pan_cooldown: float = 0.7,
-    track_outside_hold: float = 0.12,
+    track_enemy_pull: float = 0.0,
+    track_pan_cooldown: float = 3.0,
+    track_outside_hold: float = 1.5,
     track_debug_dir: Path | None = None,
+    intro: str = "overlay",
+    outro: bool = True,
+    overlay_hold: float = 2.0,
+    end_seconds: float = 2.5,
+    music: str = "auto",
+    music_db: float = -20.0,
 ) -> dict[str, Any]:
+    intro_mode = str(intro or "overlay").strip().lower()
+    if intro_mode not in {"overlay", "story", "none"}:
+        raise ValueError(f"unknown intro {intro!r} (overlay|story|none)")
+    if intro_mode == "story":
+        still_seconds = float(still_seconds) if float(still_seconds) > 0 else 3.0
+    else:
+        if intro_mode == "overlay" and float(still_seconds) > 0:
+            print(
+                "[portrait] --still-seconds is deprecated for intro; "
+                "using overlay. Pass --intro story to restore the lobby card.",
+                flush=True,
+            )
+        still_seconds = 0.0
+
     info = probe(source)
     src_w = int(info["width"])
     src_h = int(info["height"])
@@ -710,29 +740,43 @@ def render_portrait(
 
             sendcmd_path = output.with_name(output.stem + "_track.cmd")
             dump_path = output.with_name(output.stem + "_track.json")
-            track_report = track_for_portrait(
-                source,
-                src_w=src_w,
-                src_h=src_h,
-                crop_w=box["crop_w"],
-                min_x=box["min_x"],
-                max_x=box["max_x"],
-                init_x=box["crop_x"],
-                start=start,
-                duration=duration,
-                still_seconds=weave_skip_s,
-                fps=track_fps,
-                dead_zone=track_dead_zone,
-                ease_s=max(0.05, float(track_ease_ms) / 1000.0),
-                max_speed_px_s=float(track_max_speed),
-                self_bias=float(track_self_bias),
-                enemy_pull=float(track_enemy_pull),
-                pan_cooldown_s=float(track_pan_cooldown),
-                outside_hold_s=float(track_outside_hold),
-                sendcmd_path=sendcmd_path,
-                dump_path=dump_path,
-                debug_dir=track_debug_dir,
-            )
+            reused = None
+            if sendcmd_path.is_file() and dump_path.is_file():
+                try:
+                    prev = json.loads(dump_path.read_text(encoding="utf-8"))
+                    prev_src = Path(str(prev.get("source") or "")).resolve()
+                    prev_cmd = Path(str(prev.get("sendcmd") or sendcmd_path))
+                    if prev_src == source.resolve() and prev_cmd.is_file():
+                        reused = prev
+                except (OSError, json.JSONDecodeError, TypeError):
+                    reused = None
+            if reused is not None:
+                print(f"[track] reuse {sendcmd_path.name}", flush=True)
+                track_report = reused
+            else:
+                track_report = track_for_portrait(
+                    source,
+                    src_w=src_w,
+                    src_h=src_h,
+                    crop_w=box["crop_w"],
+                    min_x=box["min_x"],
+                    max_x=box["max_x"],
+                    init_x=box["crop_x"],
+                    start=start,
+                    duration=duration,
+                    still_seconds=weave_skip_s,
+                    fps=track_fps,
+                    dead_zone=track_dead_zone,
+                    ease_s=max(0.05, float(track_ease_ms) / 1000.0),
+                    max_speed_px_s=float(track_max_speed),
+                    self_bias=float(track_self_bias),
+                    enemy_pull=float(track_enemy_pull),
+                    pan_cooldown_s=float(track_pan_cooldown),
+                    outside_hold_s=float(track_outside_hold),
+                    sendcmd_path=sendcmd_path,
+                    dump_path=dump_path,
+                    debug_dir=track_debug_dir,
+                )
             filt_kwargs["sendcmd_path"] = sendcmd_path
             filt_kwargs["crop_x"] = int(track_report["first_crop_x"])
 
@@ -837,6 +881,39 @@ def render_portrait(
         str(output),
     ]
     run(cmd)
+
+    wrap: dict[str, Any] | None = None
+    if intro_mode == "overlay" or outro:
+        from render_lobby_intro import resolve_lobby_assets
+        from render_rank_cards import wrap_portrait
+
+        _png, meta_path = resolve_lobby_assets(source, lobby_png, lobby_meta)
+        if meta_path is None:
+            print(
+                "[portrait] skip overlay/outro: no lobby meta sidecar "
+                f"(expected {source.stem}_lobby_meta.json)",
+                flush=True,
+            )
+        else:
+            wrap = wrap_portrait(
+                output,
+                meta_path,
+                intro=intro_mode == "overlay",
+                outro=bool(outro),
+                overlay_hold=float(overlay_hold),
+                end_seconds=float(end_seconds),
+                crf=int(crf),
+                preset=str(preset),
+            )
+
+    music_report: dict[str, Any] | None = None
+    music_mode = str(music or "auto").strip().lower()
+    if music_mode not in {"off", "none", "false", "0"}:
+        from fetch_music import mix_into, resolve_or_pick
+
+        chosen = resolve_or_pick(music_mode)
+        music_report = mix_into(output, chosen, music_db=float(music_db))
+
     out_info = probe(output)
     return {
         "source": str(source),
@@ -846,13 +923,17 @@ def render_portrait(
         "height": out_info["height"],
         "cam": {"w": cam_w, "h": cam_h, "x": cam_x, "y": cam_y},
         "cam_fraction": cam_fraction,
+        "intro": intro_mode,
+        "outro": bool(outro),
         "still_seconds": still_seconds,
         "still_mode": filt_kwargs.get("still_mode", still_mode),
         "story_intro": str(story_mp4) if story_mp4 else None,
+        "wrap": wrap,
         "game_mode": game_mode,
         "kda_overlay": kda_overlay,
         "kda": {"x": kda_x, "y": kda_y, "w": kda_w, "h": kda_h, "out_w": kda_out_w},
         "preview_frame": str(preview_frame) if preview_frame else None,
+        "music": music_report,
         "track": (
             {
                 "lock_ratio": track_report.get("lock_ratio"),
@@ -883,17 +964,41 @@ def build_parser() -> argparse.ArgumentParser:
         help="Fraction of portrait height for facecam band (default 0.34)",
     )
     p.add_argument(
+        "--intro",
+        choices=("overlay", "story", "none"),
+        default="overlay",
+        help="Opening: overlay=road-to-Challenger on gameplay (default), "
+        "story=deprecated lobby card, none=gameplay only",
+    )
+    p.add_argument(
+        "--outro",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Append the rank-card end outro (default: on)",
+    )
+    p.add_argument(
+        "--overlay-hold",
+        type=float,
+        default=2.0,
+        help="Seconds the overlay intro stays up (default: 2)",
+    )
+    p.add_argument(
+        "--end-seconds",
+        type=float,
+        default=2.5,
+        help="Rank-card outro length (default: 2.5)",
+    )
+    p.add_argument(
         "--still-seconds",
         type=float,
         default=0.0,
-        help="Opening seconds treated as lobby still; no facecam split",
+        help="Deprecated. Only used with --intro story (lobby still length)",
     )
     p.add_argument(
         "--still-mode",
         choices=("story", "champs", "contain", "cover"),
         default="story",
-        help="Lobby intro: story=animated camera (default), champs=static 10-card crop, "
-        "contain=letterbox whole card, cover=crop-fill 9:16",
+        help="Deprecated lobby intro crop. Only used with --intro story",
     )
     p.add_argument(
         "--lobby-png",
@@ -916,8 +1021,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--game-zoom",
         type=float,
-        default=1.0,
-        help="Crop zoom: 1.0=tight fill, 0.7/0.5=zoom out, 0=full-frame fit",
+        default=0.65,
+        help="Crop zoom: 1.0=tight fill, 0.65=wider + blur bars (default), 0=full-frame fit",
     )
     p.add_argument(
         "--cam-hole",
@@ -976,31 +1081,42 @@ def build_parser() -> argparse.ArgumentParser:
         "--track-self-bias",
         type=float,
         default=0.50,
-        help="Blend toward self vs nearest enemy (0.5=mid, 1=self only)",
+        help="1=center on you, 0.5=midpoint, 0=center on enemy (default 0.5)",
     )
     p.add_argument(
         "--track-enemy-pull",
         type=float,
-        default=0.45,
-        help="Max extra pull toward enemy as a fraction of crop width",
+        default=0.0,
+        help="Extra shift toward the enemy as leftover-slack fraction (0=off)",
     )
     p.add_argument(
         "--track-pan-cooldown",
         type=float,
-        default=0.7,
-        help="Minimum seconds between pans (default 0.7)",
+        default=3.0,
+        help="Minimum seconds between pans (default 3.0)",
     )
     p.add_argument(
         "--track-outside-hold",
         type=float,
-        default=0.12,
-        help="Seconds the enemy must be off-screen before a pan",
+        default=1.5,
+        help="Seconds the enemy must be off-screen before a pan (default 1.5)",
     )
     p.add_argument(
         "--track-debug-dir",
         type=Path,
         default=None,
         help="Write annotated detection JPEGs for debugging",
+    )
+    p.add_argument(
+        "--music",
+        default="auto",
+        help="Lofi bed: auto=random catalog pick (default), off, or a catalog id",
+    )
+    p.add_argument(
+        "--music-db",
+        type=float,
+        default=-20.0,
+        help="Music bed level vs game audio (default -20)",
     )
     return p
 
@@ -1023,6 +1139,10 @@ def main(argv: list[str] | None = None) -> int:
             cam_fraction=args.cam_fraction,
             still_seconds=float(args.still_seconds),
             still_mode=str(args.still_mode),
+            intro=str(args.intro),
+            outro=bool(args.outro),
+            overlay_hold=float(args.overlay_hold),
+            end_seconds=float(args.end_seconds),
             lobby_png=args.lobby_png.resolve() if args.lobby_png else None,
             lobby_meta=args.lobby_meta.resolve() if args.lobby_meta else None,
             game_mode=str(args.game_mode),
@@ -1050,6 +1170,8 @@ def main(argv: list[str] | None = None) -> int:
             track_pan_cooldown=float(args.track_pan_cooldown),
             track_outside_hold=float(args.track_outside_hold),
             track_debug_dir=args.track_debug_dir.resolve() if args.track_debug_dir else None,
+            music=str(args.music),
+            music_db=float(args.music_db),
         )
     except Exception as exc:
         print(f"error: {exc}", file=sys.stderr)

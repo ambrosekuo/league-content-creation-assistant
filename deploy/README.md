@@ -117,12 +117,14 @@ gcloud run jobs create vod-archive-nightly \
 >
 > **Recut existing archives** (no Twitch re-download): `python cloud_job.py recut-clips --vod-id <id> --cleanup` reuses `source.mp4` + `transcript.json` from GCS, replaces `lol_clips/`.
 >
-> **Clip post-process job** (separate from archive): `python cloud_job.py process-clips --vod-id <id> --cleanup` downloads `lol_clips/` (+ events sidecars), generates a ~3s lobby-card intro per game, stitches each `gNN_Champ/` folder into `lol_compilations/{folder}_weave.mp4`, uploads weaves. Cloud Run job example: `vod-clip-process` (needs `RIOT_API_KEY` secret for lobby cards).
+> **Daily compilation:** `python cloud_job.py process-daily --day-key aug12_2026 --top-k 12` restores every VOD’s `lol_clips/` for that day, ranks globally, keeps the top 12 (max 3 per game), stitches `daily_top12.mp4`, uploads to `vods/{dayKey}/_daily/`. Local: `--dataset-dir data/VOD_ID --vod-id VOD_ID` (no upload unless `--upload`).
 >
-> **Portrait post-process job** (separate): `python cloud_job.py process-portraits --vod-id <id> --cleanup` downloads `lol_compilations/gam*.mp4` (or legacy `*_weave.mp4`), renders 9:16 facecam+KDA portraits into `lol_compilations_portrait/`, uploads. Job: `vod-portrait-process` — see `deploy/create_portrait_job.example.sh`. No Riot key needed.
+> **Portrait post-process job** (separate): `python cloud_job.py process-portraits --vod-id <id> --cleanup` downloads `lol_compilations/gam*.mp4` (or legacy `*_weave.mp4`), renders 9:16 facecam+KDA portraits (overlay intro + rank-card outro) into `lol_compilations_portrait/`, uploads. Job: `vod-portrait-process` — see `deploy/create_portrait_job.example.sh`. Riot key optional (live Challenger cutoff; falls back if missing). `--intro story` restores the old lobby card.
 >
-> **Chain clips → portraits:** deploy `./deploy/deploy_clip_then_portrait_workflow.sh`, then  
-> `gcloud workflows run clip-then-portrait --location=us-east1 --data='{"vodId":"YOUR_VOD"}'`.
+> **Chain archive → clips** (no portraits):  
+> `gcloud workflows run archive-clip-portrait --location=us-east1 --data='{"vodId":"YOUR_VOD"}'`.  
+> Portraits are manual after weaves land: `gcloud run jobs execute vod-portrait-process --region=us-east1`  
+> (or `clip-then-portrait` if you want stitch + portraits together).
 
 ### Manual test (dry-run, no download)
 
@@ -161,6 +163,15 @@ gcloud scheduler jobs create http vod-archive-daily \
 ```
 
 (Wire the invoker SA with `roles/run.invoker` on the Job.)
+
+## Local archive viewer
+
+```bash
+python -m pip install -r requirements-viewer.txt
+python -m viewer
+```
+
+http://127.0.0.1:8787 — local `data/` + GCS bucket browser, keep/skip, requeue `vod-clip-process` / `vod-portrait-process` / recut.
 
 ## Local commands (safe)
 

@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -125,15 +126,46 @@ def legacy_vod_prefix(vod_id: str) -> str:
     return f"{prefix()}/{vod_id.strip().lstrip('v')}"
 
 
+def _gcloud_user_credentials():
+    """Use `gcloud auth login` when Application Default Credentials are missing."""
+    import google.oauth2.credentials  # type: ignore
+
+    token = subprocess.check_output(
+        ["gcloud", "auth", "print-access-token"],
+        text=True,
+        timeout=30,
+        stderr=subprocess.DEVNULL,
+    ).strip()
+    if not token:
+        raise GCSNotConfiguredError("gcloud auth print-access-token returned empty")
+    return google.oauth2.credentials.Credentials(token)
+
+
 def _client():
     try:
         from google.cloud import storage  # type: ignore
     except ImportError as exc:
         raise GCSNotConfiguredError(
             "google-cloud-storage is not installed. "
-            "pip install -r requirements-cloud.txt"
+            "pip install -r requirements-viewer.txt"
         ) from exc
-    return storage.Client()
+    try:
+        return storage.Client()
+    except Exception:
+        project = (
+            os.environ.get("GOOGLE_CLOUD_PROJECT")
+            or os.environ.get("GCP_PROJECT")
+            or os.environ.get("PROJECT_ID")
+            or "poststream-assistant"
+        )
+        try:
+            creds = _gcloud_user_credentials()
+        except Exception as exc:
+            raise GCSNotConfiguredError(
+                "No GCS credentials. Run: gcloud auth application-default login "
+                "(or gcloud auth login)"
+            ) from exc
+        return storage.Client(project=project, credentials=creds)
 
 
 def blob_exists(object_name: str) -> bool:
@@ -197,6 +229,199 @@ def list_vod_ids() -> list[str]:
             elif len(parts) == 3:
                 ids.add(parts[1])
     return sorted(ids)
+
+
+_DAY_KEY_RE = re.compile(r"^[a-z]{3}\d{2}_\d{4}$")
+
+
+def is_configured() -> bool:
+    return bool((os.environ.get("GCS_BUCKET") or "").strip())
+
+
+def list_vod_ids_for_day(day_key: str) -> list[str]:
+    """VOD ids under vods/{dayKey}/ (skips _daily)."""
+    client = _client()
+    bucket = client.bucket(bucket_name())
+    root = f"{prefix()}/{day_key.strip().lower().strip('/')}/"
+    ids: set[str] = set()
+    iterator = client.list_blobs(bucket, prefix=root, delimiter="/")
+    for page in iterator.pages:
+        for pref in page.prefixes:
+            vid = pref.strip("/").split("/")[-1]
+            if vid and vid != "_daily" and vid.isdigit():
+                ids.add(vid)
+    return sorted(ids)
+
+
+def list_day_keys() -> list[str]:
+    """Dated folders under vods/ (newest first)."""
+    client = _client()
+    bucket = client.bucket(bucket_name())
+    root = f"{prefix()}/"
+    days: list[str] = []
+    iterator = client.list_blobs(bucket, prefix=root, delimiter="/")
+    for page in iterator.pages:
+        for pref in page.prefixes:
+            name = pref.strip("/").split("/")[-1]
+            if _DAY_KEY_RE.fullmatch(name):
+                days.append(name)
+    return sorted(days, reverse=True)
+
+
+def list_prefix_children(object_prefix: str) -> tuple[list[str], list[dict[str, Any]]]:
+    """
+    One-level listing under a prefix.
+
+    Returns (folder names, files[{name, size, updated, contentType, object}]).
+    """
+    client = _client()
+    bucket = client.bucket(bucket_name())
+    root = object_prefix if object_prefix.endswith("/") else f"{object_prefix}/"
+    folders: list[str] = []
+    files: list[dict[str, Any]] = []
+    iterator = client.list_blobs(bucket, prefix=root, delimiter="/")
+    for page in iterator.pages:
+        for pref in page.prefixes:
+            folders.append(pref[len(root) :].strip("/"))
+        for blob in page:
+            rel = blob.name[len(root) :]
+            if not rel or rel.endswith("/"):
+                continue
+            files.append(_blob_meta(blob, rel))
+    return folders, files
+
+
+def list_objects(object_prefix: str, *, suffix: str | None = None) -> list[dict[str, Any]]:
+    """Recursive object listing (metadata only)."""
+    client = _client()
+    bucket = client.bucket(bucket_name())
+    root = object_prefix if object_prefix.endswith("/") else f"{object_prefix}/"
+    out: list[dict[str, Any]] = []
+    for blob in client.list_blobs(bucket, prefix=root):
+        if blob.name.endswith("/"):
+            continue
+        rel = blob.name[len(root) :]
+        if not rel:
+            continue
+        if suffix and not blob.name.endswith(suffix):
+            continue
+        out.append(_blob_meta(blob, rel))
+    return out
+
+
+def read_json_blob(object_name: str) -> Any:
+    client = _client()
+    bucket = client.bucket(bucket_name())
+    blob = bucket.blob(object_name)
+    if not blob.exists():
+        raise FileNotFoundError(object_name)
+    return json.loads(blob.download_as_bytes())
+
+
+def blob_bytes(object_name: str, *, start: int | None = None, end: int | None = None) -> bytes:
+    """Download a byte range (end inclusive, matching google-cloud-storage)."""
+    client = _client()
+    bucket = client.bucket(bucket_name())
+    blob = bucket.blob(object_name)
+    return blob.download_as_bytes(start=start, end=end)
+
+
+def blob_stat(object_name: str) -> dict[str, Any] | None:
+    client = _client()
+    bucket = client.bucket(bucket_name())
+    blob = bucket.blob(object_name)
+    if not blob.exists():
+        return None
+    blob.reload()
+    return _blob_meta(blob, object_name.rsplit("/", 1)[-1])
+
+
+def delete_object(object_name: str) -> bool:
+    client = _client()
+    bucket = client.bucket(bucket_name())
+    blob = bucket.blob(object_name)
+    if not blob.exists():
+        return False
+    blob.delete()
+    return True
+
+
+def list_archive_index() -> list[dict[str, Any]]:
+    """Days → VOD ids + whether _daily exists. Does not list files inside VODs."""
+    client = _client()
+    bucket = client.bucket(bucket_name())
+    days = list_day_keys()
+    index: list[dict[str, Any]] = []
+    for day in days:
+        root = f"{prefix()}/{day}/"
+        vod_ids: list[str] = []
+        has_daily = False
+        iterator = client.list_blobs(bucket, prefix=root, delimiter="/")
+        for page in iterator.pages:
+            for pref in page.prefixes:
+                name = pref.strip("/").split("/")[-1]
+                if name == "_daily":
+                    has_daily = True
+                elif name.isdigit():
+                    vod_ids.append(name)
+        index.append(
+            {
+                "dayKey": day,
+                "vodIds": sorted(vod_ids),
+                "hasDaily": has_daily,
+            }
+        )
+    return index
+
+
+def _blob_meta(blob: Any, rel: str) -> dict[str, Any]:
+    updated = blob.updated
+    return {
+        "name": rel,
+        "object": blob.name,
+        "size": int(blob.size or 0),
+        "updated": updated.isoformat() if updated else None,
+        "contentType": blob.content_type,
+    }
+
+
+def restore_day_clips(day_key: str, dest: Path) -> list[str]:
+    """Download lol_clips/ for every VOD on a day into dest/{vodId}/."""
+    dest.mkdir(parents=True, exist_ok=True)
+    restored: list[str] = []
+    for vid in list_vod_ids_for_day(day_key):
+        try:
+            restore_clips_prefix(vid, dest / vid)
+            restored.append(vid)
+            print(f"[daily] restored clips for {vid}", flush=True)
+        except FileNotFoundError as exc:
+            print(f"[daily] skip {vid}: {exc}", flush=True)
+    return restored
+
+
+def upload_daily_artifacts(local_dir: Path, *, day_key: str) -> dict[str, str]:
+    """Upload a daily compilation folder to vods/{dayKey}/_daily/."""
+    local_dir = local_dir.resolve()
+    remote_prefix = f"{prefix()}/{day_key.strip().lower()}/_daily/"
+    uploaded: dict[str, str] = {}
+    if not local_dir.is_dir():
+        return uploaded
+    removed = delete_prefix(remote_prefix)
+    if removed:
+        print(f"[upload] cleared {removed} old object(s) under {remote_prefix}", flush=True)
+    for path in sorted(p for p in local_dir.rglob("*") if p.is_file()):
+        rel = path.relative_to(local_dir).as_posix()
+        object_name = f"{remote_prefix}{rel}"
+        content_type = None
+        if path.suffix.lower() == ".json":
+            content_type = "application/json"
+        elif path.suffix.lower() == ".mp4":
+            content_type = "video/mp4"
+        elif path.suffix.lower() == ".png":
+            content_type = "image/png"
+        print(f"[upload] {rel} → {object_name}", flush=True)
+        uploaded[rel] = upload_file(path, object_name, content_type=content_type)
+    return uploaded
 
 
 def vod_archived(vod_id: str, *, dataset_dir: Path | None = None) -> bool:
@@ -425,6 +650,7 @@ def restore_clips_prefix(
         "metadata.json",
         "lol_events.json",
         "lol_events_snapped.json",
+        "transcript.json",
         "archive_manifest.json",
         ".cut_run.json",
     ):

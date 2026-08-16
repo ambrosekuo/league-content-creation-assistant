@@ -24,9 +24,10 @@ gcloud run jobs deploy vod-clip-process \
   --set-env-vars="GCS_BUCKET=${GCS_BUCKET},GCS_PREFIX=vods,TWITCH_CHANNEL=lolambrosek,RIOT_ID=twtv lolAmbrosek#twtv,RIOT_REGION=americas,WORK_DIR=/tmp/vod-work,GCS_DAY_TZ=America/New_York" \
   --set-secrets="RIOT_API_KEY=RIOT_API_KEY:latest" \
   --command=python \
-  --args="cloud_job.py,process-clips,--vod-id,${VOD_ID},--cleanup,--clean-work"
+  --args="cloud_job.py,process-clips,--vod-id,${VOD_ID},--top-k,5,--cleanup,--clean-work"
 
 echo "Execute with:"
 echo "  gcloud run jobs execute vod-clip-process --region=$REGION"
 echo "Override VOD:"
 echo "  VOD_ID=OTHER ./deploy/create_clip_job.example.sh"
+echo "Full KDA dump (no rank): add --no-rank to the job args"

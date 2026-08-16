@@ -5,8 +5,9 @@ Detects the self nameplate (gold/yellow HP fill + bright summoner-name text
 above it) instead of running a full-frame detector. Missing frames (death,
 dash, fog) hold the last known x. Camera motion uses a dead zone + easing
 so the 9:16 crop follows like an editor pan, not a locked reticle.
-Pans only when a nearby enemy leaves the portrait; the target is the
-midpoint between you and them.
+Pans only when a nearby enemy leaves the portrait. The target is a
+weighted point between you and them (self_bias 0.5 = midpoint,
+lower = more enemy).
 """
 
 from __future__ import annotations
@@ -68,7 +69,9 @@ def _in_overlay(x: int, y: int, w: int, h: int) -> bool:
     # Stream overlay (rank / TRACK DIFF) and HUD / facecam.
     if y < int(0.14 * h):
         return True
-    if x < int(0.30 * w) and y < int(0.28 * h):
+    # Rank card + match-history row only. The old 30%×28% box ate
+    # laner nameplates on the left of mid (Pantheon in the side bush).
+    if x < int(0.26 * w) and y < int(0.22 * h):
         return True
     if y > int(0.76 * h):
         return True
@@ -229,8 +232,12 @@ def detect_nameplate(
             return abs(hit[0] - sx) + 0.4 * abs(hit[1] - sy)
 
         if nearby:
-            cand = min(nearby, key=fight_dist)
-            # Ignore far-lane red bars; keep people in the current fight.
+            # A red bar glued to self is usually a minion / false lock,
+            # not the laner sitting in a river bush.
+            glued = 90.0 * max(scale, 0.5)
+            far = [hit for hit in nearby if fight_dist(hit) >= glued]
+            pool = far or nearby
+            cand = min(pool, key=fight_dist)
             if fight_dist(cand) <= 820.0 * max(scale, 0.5):
                 enemy_hit = cand
     return self_hit, enemy_hit
@@ -398,15 +405,26 @@ def camera_path(
     fps: float = 4.0,
     max_speed_px_s: float = 860.0,
     self_bias: float = 0.50,
-    enemy_pull: float = 0.45,
-    pan_cooldown_s: float = 0.7,
-    outside_hold_s: float = 0.12,
+    enemy_pull: float = 0.0,
+    pan_cooldown_s: float = 3.0,
+    outside_hold_s: float = 1.5,
+    reframe_frac: float = 0.10,
+    teleport_px: float = 640.0,
 ) -> tuple[list[tuple[float, int]], int]:
     """Keep a nearby enemy in the 9:16 window without chasing every step.
 
-    When both fit, the crop frames the pair. When they don't, you sit near
-    the edge and the camera looks toward them. No pan while the enemy is
-    already comfortably on screen.
+    When both fit, the crop frames the pair with ``self_bias`` (1=center on
+    you, 0.5=midpoint, 0=center on them) plus ``enemy_pull`` of leftover
+    slack toward the enemy. When they don't fit, you sit near the edge
+    looking at them.
+
+    Also re-center when the desired crop has drifted by ``reframe_frac`` of
+    the window (wide crops otherwise stay pointed at an old fight). A jump
+    in self.x of ``teleport_px`` (stitched clip / recall) snaps after a few
+    confirming samples. Walking or dashing off the crop eases at
+    ``max_speed_px_s`` and still respects cooldown — it does not snap.
+    When the enemy vanishes (brush / fog), keep peeking toward their last
+    side so the bush stays in frame.
     """
     min_x = even(max(0, min_x))
     max_x = even(max(min_x, max_x))
@@ -420,19 +438,35 @@ def camera_path(
     def crop_for_pair(champ: float, enemy: float) -> float:
         left = min(champ, enemy) - pad
         right = max(champ, enemy) + pad
+        bias = max(0.0, min(1.0, float(self_bias)))
+        pull = max(0.0, min(1.0, float(enemy_pull)))
         if right - left <= crop_w:
-            return clamp_x((left + right) / 2.0 - crop_w / 2.0)
+            focus = champ * bias + enemy * (1.0 - bias)
+            cam = focus - crop_w / 2.0
+            lo = right - crop_w
+            hi = left
+            cam = max(lo, min(cam, hi))
+            enemy_bound = hi if enemy >= champ else lo
+            cam = cam + (enemy_bound - cam) * pull
+            return clamp_x(cam)
         if enemy >= champ:
             return clamp_x(champ - edge)
         return clamp_x(champ - (crop_w - edge))
 
-    def crop_for_self(champ: float) -> float:
-        return clamp_x(champ - crop_w / 2.0)
+    look_frac = 0.12
+    enemy_hold_miss = 8
+
+    def crop_for_self(champ: float, look: float = 0.0) -> float:
+        # look +1 = extra room on the right (peek into a river bush).
+        cam = champ - crop_w / 2.0 + float(look) * look_frac * crop_w
+        return clamp_x(cam)
 
     cam = float(clamp_x(init_x))
     first = next((d for d in detections if d is not None), None)
+    last_look = 0.0
     if first is not None:
         if first.enemy_x is not None:
+            last_look = 1.0 if first.enemy_x >= first.x else -1.0
             cam = crop_for_pair(first.x, first.enemy_x)
         else:
             cam = crop_for_self(first.x)
@@ -448,47 +482,105 @@ def camera_path(
     last_commit_t = -1e9
     outside_for = 0.0
     pan_commits = 0
+    prev_x: float | None = None
+    pending_jump_x: float | None = None
+    pending_jump_n = 0
+    reframe_px = max(48.0, float(reframe_frac) * crop_w)
+    jump_px = max(120.0, float(teleport_px))
     path: list[tuple[float, int]] = []
 
     for i, det in enumerate(detections):
         t = i * dt if det is None else det.t
+        teleported = False
         if det is not None:
+            if prev_x is not None and abs(det.x - prev_x) >= jump_px:
+                if pending_jump_x is not None and abs(det.x - pending_jump_x) < 90.0:
+                    pending_jump_n += 1
+                else:
+                    pending_jump_x = det.x
+                    pending_jump_n = 1
+                if pending_jump_n >= 3:
+                    teleported = True
+                    prev_x = det.x
+                    pending_jump_x = None
+                    pending_jump_n = 0
+            else:
+                pending_jump_x = None
+                pending_jump_n = 0
+                prev_x = det.x
             held = det.x
             if det.enemy_x is not None:
                 held_enemy = det.enemy_x
+                last_look = 1.0 if det.enemy_x >= det.x else -1.0
                 enemy_miss = 0
             else:
                 enemy_miss += 1
-                if enemy_miss >= 8:
+                if enemy_miss >= enemy_hold_miss:
                     held_enemy = None
+                    last_look = 0.0
         champ = held
         enemy = held_enemy
+        # Hard cut only: stitched clip / recall. Walking off the 9:16
+        # window used to snap here too, which bypassed cooldown + easing
+        # and looked like an instant pan.
+        if champ is not None and teleported:
+            target = (
+                crop_for_pair(champ, enemy)
+                if enemy is not None
+                else crop_for_self(champ, last_look)
+            )
+            cam = target
+            last_commit_t = t
+            outside_for = 0.0
+            pan_commits += 1
+            path.append((max(0.0, t), even(int(round(cam)))))
+            continue
+        if pending_jump_n >= 1:
+            path.append((max(0.0, t), even(int(round(cam)))))
+            continue
         want = target
         should_pan = False
         fully_out = False
+        self_out = champ is not None and (champ < cam or champ > cam + crop_w)
         if champ is not None and enemy is not None:
+            want = crop_for_pair(champ, enemy)
             enemy_in = _in_crop(enemy, cam, crop_w, pad)
             self_in = _in_crop(champ, cam, crop_w, 4.0)
+            off = abs(want - cam)
             if (not enemy_in) or (not self_in):
-                want = crop_for_pair(champ, enemy)
                 should_pan = True
-                fully_out = (enemy < cam) or (enemy > cam + crop_w)
-        elif champ is not None and not _in_crop(champ, cam, crop_w, pad):
-            want = crop_for_self(champ)
-            should_pan = True
-            fully_out = (champ < cam) or (champ > cam + crop_w)
+                fully_out = (
+                    self_out
+                    or (enemy < cam)
+                    or (enemy > cam + crop_w)
+                )
+            elif off >= reframe_px:
+                should_pan = True
+                fully_out = off >= reframe_px * 1.2
+        elif champ is not None:
+            want = crop_for_self(champ, last_look)
+            off = abs(want - cam)
+            if not _in_crop(champ, cam, crop_w, pad):
+                should_pan = True
+                fully_out = self_out
+            elif off >= reframe_px:
+                should_pan = True
+                fully_out = off >= reframe_px * 1.2
         if should_pan:
             outside_for += dt
-        else:
+        elif abs(want - cam) < 80.0:
             outside_for = 0.0
         want = clamp_x(want)
         settled = abs(cam - target) < 8.0
+        # Self off-screen: start sooner so we don't sit on empty map, but
+        # still ease + cooldown. Reframe / enemy-peek keeps the long hold.
+        need_hold = 0.35 if self_out or (should_pan and not fully_out) else hold_out
         if (
             should_pan
-            and outside_for >= hold_out
+            and outside_for >= need_hold
             and (t - last_commit_t) >= cooldown
             and abs(want - cam) > 12.0
-            and (fully_out or settled)
+            and settled
         ):
             target = want
             last_commit_t = t
@@ -562,9 +654,9 @@ def track_for_portrait(
     ease_s: float = 0.28,
     max_speed_px_s: float = 860.0,
     self_bias: float = 0.50,
-    enemy_pull: float = 0.45,
-    pan_cooldown_s: float = 0.7,
-    outside_hold_s: float = 0.12,
+    enemy_pull: float = 0.0,
+    pan_cooldown_s: float = 3.0,
+    outside_hold_s: float = 1.5,
     sendcmd_path: Path,
     dump_path: Path | None = None,
     debug_dir: Path | None = None,
@@ -593,6 +685,8 @@ def track_for_portrait(
         enemy_pull=enemy_pull,
         pan_cooldown_s=pan_cooldown_s,
         outside_hold_s=outside_hold_s,
+        reframe_frac=0.10,
+        teleport_px=640.0,
     )
     dense = densify_path(path, fps=30.0)
     write_sendcmd(sendcmd_path, dense)
@@ -659,10 +753,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dead-zone", type=float, default=0.10, help="Edge inset before enemy counts as off-screen")
     p.add_argument("--ease-ms", type=float, default=280.0)
     p.add_argument("--max-speed", type=float, default=860.0, help="Max crop pan speed in px/s")
-    p.add_argument("--self-bias", type=float, default=0.50, help="0.5=midpoint, 1=self only")
-    p.add_argument("--enemy-pull", type=float, default=0.45, help="Max pull toward enemy as crop-width fraction")
-    p.add_argument("--pan-cooldown", type=float, default=0.7, help="Minimum seconds between pans")
-    p.add_argument("--outside-hold", type=float, default=0.12, help="Seconds enemy must be off-screen before a pan")
+    p.add_argument("--self-bias", type=float, default=0.50, help="1=center on you, 0.5=midpoint, 0=center on enemy")
+    p.add_argument(
+        "--enemy-pull",
+        type=float,
+        default=0.0,
+        help="Extra shift toward the enemy as a fraction of leftover slack (0=off, 1=hard edge)",
+    )
+    p.add_argument("--pan-cooldown", type=float, default=3.0, help="Minimum seconds between pans")
+    p.add_argument("--outside-hold", type=float, default=1.5, help="Seconds enemy must be off-screen before a pan")
     return p
 
 
