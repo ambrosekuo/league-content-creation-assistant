@@ -4,101 +4,25 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Poststream Assistant</title>
-    <meta
-      name="description"
-      content="Poststream Assistant is a creator tool for preparing and publishing gaming content to TikTok, YouTube, and more."
-    />
+    <meta http-equiv="refresh" content="0; url=./home/" />
+    <link rel="canonical" href="./home/" />
     <link rel="icon" href="./assets/mark.png" type="image/png" />
-    <link rel="preconnect" href="https://fonts.googleapis.com" />
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-    <link
-      href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,600;9..144,700&family=Sora:wght@400;600&display=swap"
-      rel="stylesheet"
-    />
-    <link rel="stylesheet" href="./styles.css" />
+    <style>
+      body {
+        margin: 0;
+        min-height: 100vh;
+        display: grid;
+        place-items: center;
+        font-family: system-ui, sans-serif;
+        background: #07090d;
+        color: #f2f4f7;
+      }
+      a {
+        color: #d6ff4b;
+      }
+    </style>
   </head>
   <body>
-    <header class="site-header">
-      <a class="wordmark" href="./">
-        <img src="./assets/mark.png" width="32" height="32" alt="" />
-        Poststream Assistant
-      </a>
-      <nav class="nav-links" aria-label="Legal">
-        <a href="./privacy/">Privacy Policy</a>
-        <a href="./terms/">Terms of Service</a>
-      </nav>
-    </header>
-
-    <main>
-      <section class="hero" aria-label="Poststream Assistant">
-        <div class="hero-media" aria-hidden="true">
-          <img src="./assets/hero.jpg" alt="" />
-        </div>
-        <div class="hero-copy">
-          <h1 class="brand">Poststream Assistant</h1>
-          <p class="lede">
-            Creator tool for preparing and publishing gaming content.
-          </p>
-          <div class="cta-row">
-            <a class="btn btn-primary" href="./privacy/">Privacy Policy</a>
-            <a class="btn btn-ghost" href="./terms/">Terms of Service</a>
-          </div>
-        </div>
-      </section>
-
-      <section class="section" id="about">
-        <h2>What it is</h2>
-        <p>
-          Poststream Assistant helps creators turn long gaming streams into short-form
-          videos, then send finished drafts to platforms such as TikTok and YouTube.
-          Processing and uploads run on your machine; this website describes the
-          service for app review and account authorization.
-        </p>
-        <ul class="feature-list">
-          <li>
-            <strong>Prepare clips locally</strong>
-            Cut, score, caption, and mix shorts from VODs without uploading your archive
-            to this site.
-          </li>
-          <li>
-            <strong>Publish with platform APIs</strong>
-            Connect your TikTok or YouTube account so the desktop uploader can place
-            drafts or private videos for you to finish in-app.
-          </li>
-          <li>
-            <strong>You stay in control</strong>
-            Nothing is auto-published as a public post from this tool’s TikTok draft
-            flow. You review captions, covers, and timing before anything goes live.
-          </li>
-        </ul>
-      </section>
-
-      <section class="section" id="tiktok">
-        <h2>TikTok integration</h2>
-        <p>
-          Poststream Assistant uses TikTok’s Content Posting API with the
-          <code>video.upload</code> scope to send videos into your TikTok draft inbox.
-          Authorization uses OAuth. Tokens stay on the device that runs the uploader.
-          See the <a href="./privacy/">Privacy Policy</a> for what is stored and how
-          to revoke access.
-        </p>
-      </section>
-    </main>
-
-    <footer class="site-footer">
-      <div class="site-footer-inner">
-        <span>© <span id="y"></span> Poststream Assistant</span>
-        <span>
-          <a href="./privacy/">Privacy</a>
-          ·
-          <a href="./terms/">Terms</a>
-          ·
-          <a href="./callback/">OAuth callback</a>
-        </span>
-      </div>
-    </footer>
-    <script>
-      document.getElementById("y").textContent = String(new Date().getFullYear());
-    </script>
+    <p><a href="./home/">Continue to Poststream Assistant</a></p>
   </body>
 </html>
