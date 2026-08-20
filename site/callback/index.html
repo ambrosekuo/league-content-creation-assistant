@@ -1,0 +1,72 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>OAuth callback · Poststream Assistant</title>
+    <meta
+      name="description"
+      content="OAuth redirect landing page for Poststream Assistant desktop login."
+    />
+    <link rel="icon" href="../assets/mark.png" type="image/png" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,600;9..144,700&family=Sora:wght@400;600&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="../styles.css" />
+  </head>
+  <body>
+    <main class="callback-shell">
+      <div class="callback-panel">
+        <h1>Authorization received</h1>
+        <p>
+          Paste this full URL back into your Poststream Assistant terminal
+          (<code>post_short.py --login tiktok</code> prompt, then return to the app.
+        </p>
+        <code class="callback-code" id="redirect-url">Waiting for redirect…</code>
+        <button class="btn btn-primary" type="button" id="copy-btn">Copy URL</button>
+        <p class="callback-status" id="status" role="status"></p>
+        <p>
+          <a href="../">Back to Poststream Assistant</a>
+          ·
+          <a href="../privacy/">Privacy Policy</a>
+        </p>
+      </div>
+    </main>
+    <script>
+      (function () {
+        var urlEl = document.getElementById("redirect-url");
+        var statusEl = document.getElementById("status");
+        var copyBtn = document.getElementById("copy-btn");
+        var href = window.location.href;
+        urlEl.textContent = href;
+
+        var params = new URLSearchParams(window.location.search);
+        if (params.get("error")) {
+          statusEl.textContent =
+            params.get("error_description") ||
+            params.get("error") ||
+            "Authorization was denied.";
+        } else if (params.get("code")) {
+          statusEl.textContent = "Auth code detected. Copy the URL above into the uploader.";
+        } else {
+          statusEl.textContent =
+            "No code yet. Register this page as your TikTok redirect URI, then complete login.";
+        }
+
+        copyBtn.addEventListener("click", function () {
+          navigator.clipboard.writeText(href).then(
+            function () {
+              statusEl.textContent = "Copied.";
+            },
+            function () {
+              statusEl.textContent = "Copy failed — select the URL manually.";
+            }
+          );
+        });
+      })();
+    </script>
+  </body>
+</html>

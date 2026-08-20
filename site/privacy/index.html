@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Privacy Policy · Poststream Assistant</title>
+    <meta
+      name="description"
+      content="Privacy Policy for Poststream Assistant, including TikTok and YouTube API usage."
+    />
+    <link rel="icon" href="../assets/mark.png" type="image/png" />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,600;9..144,700&family=Sora:wght@400;600&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="../styles.css" />
+  </head>
+  <body class="legal-page">
+    <header class="site-header">
+      <a class="wordmark" href="../">
+        <img src="../assets/mark.png" width="32" height="32" alt="" />
+        Poststream Assistant
+      </a>
+      <nav class="nav-links" aria-label="Legal">
+        <a href="./">Privacy Policy</a>
+        <a href="../terms/">Terms of Service</a>
+      </nav>
+    </header>
+
+    <main class="legal-wrap">
+      <h1>Privacy Policy</h1>
+      <p class="legal-meta">Last updated: August 20, 2026</p>
+
+      <p>
+        This Privacy Policy describes how <strong>Poststream Assistant</strong>
+        (“we”, “the Service”) handles information when you use the website at this
+        domain and the related desktop uploader that connects to third-party
+        platforms such as TikTok and YouTube.
+      </p>
+
+      <h2>1. Who we are</h2>
+      <p>
+        Poststream Assistant is a creator tool for preparing and publishing gaming
+        content. The public website explains the Service and hosts this policy and
+        our Terms. Video processing and uploads run on software you operate on your
+        own computer (or your own cloud jobs), not on this static website.
+      </p>
+
+      <h2>2. Information we collect</h2>
+      <p>Depending on how you use the Service, the following may be involved:</p>
+      <ul>
+        <li>
+          <strong>Account authorization data.</strong> When you connect TikTok or
+          YouTube through OAuth, the platform may issue access and refresh tokens,
+          an open ID or channel ID, granted scopes, and expiry times. Those tokens
+          are stored locally on the device running the uploader (for example under a
+          local secrets folder), not on this website.
+        </li>
+        <li>
+          <strong>Content you choose to upload.</strong> Video files, titles,
+          descriptions, and related metadata that you select in the uploader are
+          sent directly to the destination platform’s APIs.
+        </li>
+        <li>
+          <strong>Website analytics.</strong> This static site does not run
+          first-party analytics cookies. Your browser and hosting provider (for
+          example GitHub Pages) may process standard server or CDN logs such as IP
+          address, user agent, and requested URLs.
+        </li>
+      </ul>
+
+      <h2>3. How we use information</h2>
+      <ul>
+        <li>To authorize the uploader against TikTok, YouTube, or other platforms you enable.</li>
+        <li>To upload drafts or private videos on your behalf according to the scopes you grant.</li>
+        <li>To operate and secure this informational website.</li>
+        <li>To respond if you contact us about privacy or access requests.</li>
+      </ul>
+      <p>We do not sell personal information.</p>
+
+      <h2>4. TikTok</h2>
+      <p>
+        Poststream Assistant may use TikTok’s developer products, including the
+        Content Posting API with the <code>video.upload</code> scope, to place
+        videos into your TikTok draft inbox after you authorize the app. We use
+        TikTok login credentials and related API responses only to provide that
+        upload functionality. TikTok’s own policies also apply when you use TikTok.
+        You can revoke Poststream Assistant’s access from your TikTok account
+        settings / authorized apps.
+      </p>
+
+      <h2>5. YouTube / Google</h2>
+      <p>
+        If you connect YouTube, the uploader uses Google OAuth and the YouTube Data
+        API to create videos (typically as private until you finish them in YouTube
+        Studio). Google’s privacy terms apply to data Google processes. You can
+        revoke access from your Google Account permissions.
+      </p>
+
+      <h2>6. Sharing</h2>
+      <p>
+        Content and tokens are shared with the platforms you connect (TikTok,
+        Google/YouTube, and any other APIs you configure) solely to perform the
+        actions you request. We do not share your data with advertisers. Hosting
+        for this website may involve GitHub or another static host acting as a
+        processor for HTTP requests.
+      </p>
+
+      <h2>7. Retention</h2>
+      <p>
+        OAuth tokens remain on your device until you delete them, re-authorize, or
+        they expire. Platform copies of uploaded videos are retained under each
+        platform’s rules. This website does not maintain a user account database.
+      </p>
+
+      <h2>8. Security</h2>
+      <p>
+        Keep your device, <code>.env</code> files, and local token stores private.
+        Use HTTPS redirect URIs registered in each developer console. We cannot
+        guarantee absolute security of any internet-connected system.
+      </p>
+
+      <h2>9. Children</h2>
+      <p>
+        The Service is not directed to children under 13, and we do not knowingly
+        collect personal information from children.
+      </p>
+
+      <h2>10. Your choices</h2>
+      <ul>
+        <li>Revoke platform access in TikTok or Google account settings.</li>
+        <li>Delete local token files and stop using the uploader.</li>
+        <li>Contact us to ask questions about this policy.</li>
+      </ul>
+
+      <h2>11. Contact</h2>
+      <p>
+        Privacy questions:
+        <a href="https://github.com/ambrosekuo/league-content-creation-assistant/issues"
+          >open an issue on the Poststream Assistant GitHub repository</a
+        >.
+      </p>
+
+      <h2>12. Changes</h2>
+      <p>
+        We may update this policy from time to time. The “Last updated” date at the
+        top will change when we do. Continued use of the Service after updates means
+        you accept the revised policy.
+      </p>
+    </main>
+
+    <footer class="site-footer">
+      <div class="site-footer-inner">
+        <span>© <span id="y"></span> Poststream Assistant</span>
+        <span>
+          <a href="../">Home</a>
+          ·
+          <a href="../terms/">Terms</a>
+        </span>
+      </div>
+    </footer>
+    <script>
+      document.getElementById("y").textContent = String(new Date().getFullYear());
+    </script>
+  </body>
+</html>
