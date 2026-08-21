@@ -27,9 +27,11 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+from ffmpeg_color import IMAGE_TO_BT709, VIDEO_TO_BT709, X264_BT709
 from generate_lobby_card import (
     TIER_COLORS,
     TIER_SHORT,
+    challenger_crown,
     champ_key,
     champion_icon,
     champion_splash,
@@ -42,6 +44,11 @@ from generate_lobby_card import (
 ROOT = Path(__file__).resolve().parent
 OUT_W = 1080
 OUT_H = 1920
+# Slightly above original so mobile chrome doesn't cover streamer icons.
+OVERLAY_ROAD_CY = 1040
+OVERLAY_STREAMERS_CY = 1280
+OVERLAY_STREAMERS_TILE = 128
+OVERLAY_STREAMERS_GAP = 18
 BG = (10, 12, 18)
 GOLD = (255, 214, 90)
 WHITE = (244, 244, 248)
@@ -300,16 +307,38 @@ def _catalog_aliases(entry: dict[str, Any]) -> list[str]:
     return aliases
 
 
+def _player_name_keys(player: dict[str, Any]) -> list[str]:
+    """Normalized name forms to try against catalog aliases (incl. stripped TwTv/YT prefixes)."""
+    raw = str(player.get("name") or "")
+    name = _norm_id(raw)
+    if not name:
+        return []
+    keys: list[str] = []
+    seen: set[str] = set()
+
+    def add(value: str) -> None:
+        for form in (value, value.replace(" ", "")):
+            if form and form not in seen:
+                seen.add(form)
+                keys.append(form)
+
+    add(name)
+    core = [t for t in _name_tokens(raw) if t not in STREAMER_NAME_TOKENS]
+    if core:
+        add(" ".join(core))
+    return keys
+
+
 def match_streamer(player: dict[str, Any], catalog: list[dict[str, Any]]) -> dict[str, Any] | None:
     """Match a lobby player to a catalog row. Name aliases win; tag is only a tie-break."""
-    name = _norm_id(str(player.get("name") or ""))
-    collapsed = name.replace(" ", "")
+    keys = _player_name_keys(player)
+    collapsed = next((k for k in keys if " " not in k), "")
     tag = _norm_id(str(player.get("tag") or ""))
-    if not name:
+    if not keys:
         return None
     for entry in catalog:
         aliases = _catalog_aliases(entry)
-        if name in aliases or collapsed in aliases:
+        if any(k in aliases for k in keys):
             return entry
         tags = [_norm_id(str(t)) for t in (entry.get("tags") or []) if str(t).strip()]
         if tag and tag in tags and any(alias and (alias in collapsed or collapsed in alias) for alias in aliases):
@@ -481,15 +510,115 @@ def _streamer_display(
     return label
 
 
-def _callout_priority(row: dict[str, Any]) -> tuple[int, int]:
-    """Pros first, then Twitch partners. Allies before enemies in the same bucket."""
+def _callout_priority(row: dict[str, Any]) -> tuple[int, int, int]:
+    """Pros > Challenger (by ladder rank) > partners/catalog > small streamers.
+
+    Allies before enemies inside the same bucket. Challengers bump affiliates
+    and other low-signal Twitch hits out of the 3-slot overlay row.
+    """
     kind = str(row.get("kind") or "")
     source = str(row.get("source") or "")
+    btype = str(row.get("broadcasterType") or "").lower()
     if kind == "pro" or source == "pro":
-        tier = 0
+        bucket = 0
+        sub = 0
+    elif kind == "challenger":
+        bucket = 1
+        sub = int(row.get("ladderRank") or 9999)
+    elif source == "catalog" or btype == "partner":
+        bucket = 2
+        sub = 0
     else:
-        tier = 1
-    return (tier, 0 if row.get("ally") else 1)
+        bucket = 3
+        sub = 0
+    return (bucket, sub, 0 if row.get("ally") else 1)
+
+
+def _player_is_challenger(player: dict[str, Any]) -> bool:
+    return str(player.get("tier") or "").upper() == "CHALLENGER"
+
+
+def _callout_side_label(row: dict[str, Any]) -> str:
+    kind = str(row.get("kind") or "")
+    if kind == "pro":
+        return "PRO"
+    return "ALLY" if row.get("ally") else "ENEMY"
+
+
+def _callout_rank_label(row: dict[str, Any]) -> str:
+    """Ladder standing drawn above the Challenger crown, e.g. RANK 24."""
+    if str(row.get("kind") or "") != "challenger":
+        return ""
+    rank = row.get("ladderRank")
+    if rank is None:
+        return "CHALLENGER"
+    try:
+        return f"RANK {int(rank)}"
+    except (TypeError, ValueError):
+        return "CHALLENGER"
+
+
+def _callout_rank_color(row: dict[str, Any]) -> tuple[int, int, int]:
+    """RANK label above the crown — gold so it reads over cyan ALLY/ENEMY."""
+    if str(row.get("kind") or "") == "challenger":
+        return GOLD
+    return _callout_ring(row)
+
+
+def _callout_ring(row: dict[str, Any]) -> tuple[int, int, int]:
+    kind = str(row.get("kind") or "")
+    if kind == "pro":
+        return GOLD
+    if not row.get("ally"):
+        return RED
+    if kind == "challenger":
+        return TIER_COLORS.get("CHALLENGER", (90, 180, 230))
+    return GOLD
+
+
+_challenger_ladder_cache: dict[str, list[int]] = {}
+
+
+def fetch_challenger_ladder_lps(*, platform: str = "na1") -> list[int]:
+    """LP list for the live Challenger ladder, highest first (cached per process)."""
+    key = platform.strip().lower() or "na1"
+    cached = _challenger_ladder_cache.get(key)
+    if cached is not None:
+        return cached
+
+    from env_loader import load_dotenv
+
+    load_dotenv()
+    api_key = os.environ.get("RIOT_API_KEY", "").strip()
+    if not api_key:
+        _challenger_ladder_cache[key] = []
+        return []
+    try:
+        sys.path.insert(0, str(ROOT / "lol-indexer"))
+        from riot_api import RiotAPI
+
+        chall = RiotAPI(api_key).get_challenger_league(platform=key)
+    except Exception as exc:
+        print(f"[lobby] challenger ladder lookup failed: {exc}", flush=True)
+        _challenger_ladder_cache[key] = []
+        return []
+    lps = sorted(_league_lps(chall), reverse=True)
+    _challenger_ladder_cache[key] = lps
+    return lps
+
+
+def challenger_ladder_rank(lp: Any, ladder_lps: list[int]) -> int | None:
+    """1-based Challenger standing from LP (ties share the better rank)."""
+    if lp is None or not ladder_lps:
+        return None
+    try:
+        value = int(lp)
+    except (TypeError, ValueError):
+        return None
+    # Still tagged Challenger after falling below the board — no number.
+    if value < int(ladder_lps[-1]) and value not in ladder_lps:
+        return None
+    return 1 + sum(1 for other in ladder_lps if other > value)
 
 
 def detect_streamers(
@@ -499,12 +628,25 @@ def detect_streamers(
     pros: list[dict[str, Any]] | None = None,
     lookup: bool = True,
     quiet: bool = False,
+    platform: str | None = None,
 ) -> list[dict[str, Any]]:
-    """Pros and Twitch partners in this lobby. Affiliates and IGN-only hits are ignored."""
+    """Pros, Challengers, catalog streamers, and Twitch partners in this lobby.
+
+    Challengers (with ladder RANK when resolvable) outrank small streamers so
+    the overlay prefers e.g. \"pro, pro, Maxander RANK 22\" over affiliates.
+    """
     entries = catalog if catalog is not None else load_streamer_catalog()
     pro_entries = pros if pros is not None else load_pro_catalog()
     players = [p for p in (meta.get("players") or []) if not p.get("mine")]
     twitch_map = lookup_twitch_streamers(players) if lookup else {}
+    cutoff_platform = (
+        platform
+        or str(meta.get("cutoffPlatform") or meta.get("platform") or "")
+        or str((meta.get("hook") or {}).get("platform") or "")
+        or "na1"
+    )
+    need_ladder = any(_player_is_challenger(p) for p in players)
+    ladder_lps = fetch_challenger_ladder_lps(platform=cutoff_platform) if need_ladder else []
     found: list[dict[str, Any]] = []
     seen: set[str] = set()
     for player in players:
@@ -512,27 +654,38 @@ def detect_streamers(
         catalog_hit = match_streamer(player, entries)
         key = f"{player.get('name') or ''}#{player.get('tag') or ''}"
         twitch_hit = twitch_map.get(key)
-        btype = str((twitch_hit or {}).get("broadcasterType") or "")
-        if pro_hit is None and btype != "partner":
+        is_challenger = _player_is_challenger(player)
+        if (
+            pro_hit is None
+            and catalog_hit is None
+            and twitch_hit is None
+            and not is_challenger
+        ):
             continue
         display = _streamer_display(
             player,
             catalog_hit=pro_hit or catalog_hit,
             twitch_hit=twitch_hit,
         )
-        sid = str(
-            (pro_hit or {}).get("id")
-            or (catalog_hit or {}).get("id")
-            or (twitch_hit or {}).get("id")
-            or display
-            or player.get("name")
-            or ""
-        ).lower()
+        player_key = (
+            f"{_norm_id(str(player.get('name') or ''))}"
+            f"#{_norm_id(str(player.get('tag') or ''))}"
+        )
+
+        sid = player_key
         if sid in seen:
             continue
         seen.add(sid)
+        ladder_rank = (
+            challenger_ladder_rank(player.get("lp"), ladder_lps)
+            if is_challenger
+            else None
+        )
+        # Pros stay pros. Otherwise Challenger identity beats streamer labels.
         if pro_hit is not None:
             kind, source = "pro", "pro"
+        elif is_challenger:
+            kind, source = "challenger", "rank"
         elif catalog_hit is not None:
             kind, source = "streamer", "catalog"
         elif twitch_hit is not None:
@@ -553,6 +706,9 @@ def detect_streamers(
                 "source": source,
                 "login": (twitch_hit or {}).get("login"),
                 "broadcasterType": (twitch_hit or {}).get("broadcasterType") or "",
+                "tier": str(player.get("tier") or ""),
+                "lp": player.get("lp"),
+                "ladderRank": ladder_rank,
             }
         )
     found.sort(key=_callout_priority)
@@ -561,12 +717,13 @@ def detect_streamers(
             summary = ", ".join(
                 f"{row['display']} ({'ally' if row.get('ally') else 'enemy'} "
                 f"{row.get('champion') or '?'} · {row.get('kind') or row.get('source')}"
+                f"{' rank ' + str(row['ladderRank']) if row.get('ladderRank') else ''}"
                 f"{' ' + row['broadcasterType'] if row.get('broadcasterType') else ''})"
                 for row in found
             )
             print(f"[lobby] {len(found)} notables: {summary}", flush=True)
         else:
-            print("[lobby] no pros or streamers detected", flush=True)
+            print("[lobby] no pros, challengers, or streamers detected", flush=True)
     return found
 
 
@@ -978,10 +1135,11 @@ def write_clip(
                 "-shortest",
             ]
         cmd += [
+            "-vf",
+            IMAGE_TO_BT709,
             "-c:v",
             "libx264",
-            "-pix_fmt",
-            "yuv420p",
+            *X264_BT709,
             "-crf",
             "18",
             "-preset",
@@ -1089,7 +1247,7 @@ def resolve_cutoff_lp(card: dict[str, Any]) -> int | None:
 def render_road_progress_overlay(
     card: dict[str, Any],
     *,
-    cy: int = 1180,
+    cy: int = OVERLAY_ROAD_CY,
     opacity: float = 0.90,
 ):
     """Headline + current LP / Challenger-cutoff bar, centered."""
@@ -1212,51 +1370,82 @@ def draw_streamer_callouts(
     canvas,
     streamers: list[dict[str, Any]],
     *,
-    cy: int = 1520,
-    tile: int = 176,
+    cy: int = OVERLAY_STREAMERS_CY,
+    tile: int = OVERLAY_STREAMERS_TILE,
+    gap: int = OVERLAY_STREAMERS_GAP,
 ) -> None:
-    """Big champ tiles + names for known streamers in this lobby."""
+    """Champ tiles + names for known notables in this lobby.
+
+    Challengers keep ALLY/ENEMY under the tile, with RANK N above the crown.
+    """
     from PIL import ImageDraw
 
     if not streamers:
         return
     draw = ImageDraw.Draw(canvas)
-    gap = 36
-    label_gap = 14
+    crown_art = challenger_crown()
+    # Emblem is wide; size by width and keep aspect so it doesn't squash.
+    if crown_art is not None:
+        crown_w = max(52, int(tile * 0.78))
+        crown_h = max(
+            28,
+            int(round(crown_art.height * (crown_w / max(crown_art.width, 1)))),
+        )
+        crown_size = (crown_w, crown_h)
+        crown_lift = crown_h // 2 + 6
+    else:
+        crown_size = (0, 0)
+        crown_lift = 0
     cards: list[dict[str, Any]] = []
     for row in streamers[:3]:
         champ = str(row.get("champion") or "")
         art = champion_tile(champ, 0) or champion_icon(champ)
         if art is None:
             continue
-        ally = bool(row.get("ally"))
-        ring = GOLD if ally else RED
-        badge = champ_badge(art, tile, ring, radius=22)
+        ring = _callout_ring(row)
+        badge = champ_badge(art, tile, ring, radius=16)
         label = str(row.get("display") or row.get("name") or "").upper()
-        if str(row.get("kind") or "") == "pro":
-            side = "PRO"
-        else:
-            side = "ALLY" if ally else "ENEMY"
-        f_name = fit_font(draw, label, FONT_BLACK, 36, 280, 20)
-        f_side = font(FONT_BOLD, 18)
+        side = _callout_side_label(row)
+        rank_top = _callout_rank_label(row)
+        rank_color = _callout_rank_color(row)
+        f_name = fit_font(draw, label, FONT_BLACK, 28, 220, 16)
+        f_side = font(FONT_BOLD, 15)
+        f_rank = font(FONT_BOLD, 16)
         nw, nh = text_size(draw, label, f_name)
         sw, sh = text_size(draw, side, f_side)
-        width = max(badge.width, nw, sw)
-        height = badge.height + 8 + sh + 6 + nh
+        rw, rh = text_size(draw, rank_top, f_rank) if rank_top else (0, 0)
+        is_challenger = str(row.get("kind") or "") == "challenger"
+        use_crown = is_challenger and crown_art is not None
+        width = max(badge.width, nw, sw, rw)
+        height = badge.height + 6 + sh + 4 + nh
+        top_extra = 0
+        if use_crown:
+            top_extra += crown_lift
+        if rank_top:
+            top_extra += rh + 6
+        height += top_extra
         cards.append(
             {
                 "badge": badge,
                 "label": label,
                 "side": side,
+                "rank_top": rank_top,
                 "ring": ring,
+                "rank_color": rank_color,
                 "f_name": f_name,
                 "f_side": f_side,
+                "f_rank": f_rank,
                 "nw": nw,
                 "nh": nh,
                 "sw": sw,
                 "sh": sh,
+                "rw": rw,
+                "rh": rh,
                 "w": width,
                 "h": height,
+                "crown": use_crown,
+                "top_extra": top_extra,
+                "crown_lift": crown_lift if use_crown else 0,
             }
         )
     if not cards:
@@ -1265,18 +1454,46 @@ def draw_streamer_callouts(
     row_h = max(c["h"] for c in cards)
     x0 = (OUT_W - row_w) // 2
     y0 = int(cy - row_h / 2)
-    pad_x, pad_y = 36, 28
+    pad_x, pad_y = 24, 18
     ImageDraw.Draw(canvas).rounded_rectangle(
         (x0 - pad_x, y0 - pad_y, x0 + row_w + pad_x, y0 + row_h + pad_y),
-        radius=28,
+        radius=22,
         fill=(8, 10, 16, 150),
     )
     x = x0
     for card in cards:
         cx = x + card["w"] // 2
-        paste_center(canvas, card["badge"], cx, y0 + card["badge"].height // 2)
-        side_y = y0 + card["badge"].height + 8 + card["sh"] // 2
-        name_y = side_y + card["sh"] // 2 + 6 + card["nh"] // 2
+        cursor = y0
+        if card.get("rank_top"):
+            rank_y = cursor + card["rh"] // 2
+            draw.text(
+                (cx + 1, rank_y + 1),
+                card["rank_top"],
+                font=card["f_rank"],
+                fill=(0, 0, 0),
+                anchor="mm",
+            )
+            draw.text(
+                (cx, rank_y),
+                card["rank_top"],
+                font=card["f_rank"],
+                fill=card.get("rank_color") or card["ring"],
+                anchor="mm",
+            )
+            cursor += card["rh"] + 6
+        badge_top = cursor + int(card.get("crown_lift") or 0)
+        paste_center(canvas, card["badge"], cx, badge_top + card["badge"].height // 2)
+        if card.get("crown") and crown_art is not None:
+            # Sit the crest on the top edge of the champ tile (over the head).
+            paste_center(
+                canvas,
+                crown_art,
+                cx,
+                badge_top + 4,
+                size=crown_size,
+            )
+        side_y = badge_top + card["badge"].height + 6 + card["sh"] // 2
+        name_y = side_y + card["sh"] // 2 + 4 + card["nh"] // 2
         draw.text((cx + 2, side_y + 2), card["side"], font=card["f_side"], fill=(0, 0, 0), anchor="mm")
         draw.text((cx, side_y), card["side"], font=card["f_side"], fill=card["ring"], anchor="mm")
         draw.text((cx + 2, name_y + 2), card["label"], font=card["f_name"], fill=(0, 0, 0), anchor="mm")
@@ -1305,7 +1522,7 @@ def render_overlay_png(
     card: dict[str, Any],
     variant: str,
     *,
-    cy: int = 1180,
+    cy: int = OVERLAY_ROAD_CY,
     opacity: float = 0.90,
 ):
     """Transparent 9:16 PNG: champ/rank icons + LP on a see-through pill."""
@@ -1534,7 +1751,7 @@ def burn_overlay(
     vfilt = (
         f"[1:v]format=rgba,fade=t=in:st=0:d={fade_in:.3f}:alpha=1,"
         f"fade=t=out:st={fade_out_at:.3f}:d={fade_out:.3f}:alpha=1[ov];"
-        f"[0:v][ov]overlay=0:0:format=auto:eof_action=pass,format=yuv420p[v]"
+        f"[0:v][ov]overlay=0:0:format=auto:eof_action=pass,{VIDEO_TO_BT709}[v]"
     )
     cmd = [
         "ffmpeg",
@@ -1568,6 +1785,7 @@ def burn_overlay(
         "veryfast",
         "-crf",
         "20",
+        *X264_BT709,
         "-c:a",
         "aac",
         "-b:a",
@@ -1664,6 +1882,28 @@ def card_from_meta(
     return card
 
 
+def _fps_from_stream(stream: dict[str, Any]) -> float:
+    """Prefer avg_frame_rate — r_frame_rate is often a round 60 on ~59.9 sources."""
+    for key in ("avg_frame_rate", "r_frame_rate"):
+        rate = str(stream.get(key) or "")
+        if not rate or rate in {"0/0", "N/A"}:
+            continue
+        if "/" not in rate:
+            try:
+                fps = float(rate)
+            except ValueError:
+                continue
+        else:
+            num, den = rate.split("/", 1)
+            try:
+                fps = float(num) / max(float(den), 1.0)
+            except ValueError:
+                continue
+        if fps > 1.0:
+            return max(1.0, min(fps, 60.0))
+    return 30.0
+
+
 def _probe_av(path: Path) -> dict[str, Any]:
     proc = subprocess.run(
         [
@@ -1675,7 +1915,7 @@ def _probe_av(path: Path) -> dict[str, Any]:
             "-select_streams",
             "v:0",
             "-show_entries",
-            "stream=width,height,r_frame_rate",
+            "stream=width,height,r_frame_rate,avg_frame_rate",
             "-of",
             "json",
             str(path),
@@ -1687,14 +1927,7 @@ def _probe_av(path: Path) -> dict[str, Any]:
         raise RuntimeError(proc.stderr or "ffprobe failed")
     data = json.loads(proc.stdout or "{}")
     stream = (data.get("streams") or [{}])[0]
-    rate = str(stream.get("r_frame_rate") or "30/1")
-    fps = 30.0
-    if "/" in rate:
-        num, den = rate.split("/", 1)
-        try:
-            fps = float(num) / max(float(den), 1.0)
-        except ValueError:
-            fps = 30.0
+    fps = _fps_from_stream(stream)
     audio = subprocess.run(
         [
             "ffprobe",
@@ -1715,7 +1948,7 @@ def _probe_av(path: Path) -> dict[str, Any]:
         "width": int(stream.get("width") or OUT_W),
         "height": int(stream.get("height") or OUT_H),
         "duration": float((data.get("format") or {}).get("duration") or 0.0),
-        "fps": max(1.0, min(fps, 60.0)),
+        "fps": fps,
         "has_audio": bool((audio.stdout or "").strip()),
     }
 
@@ -1751,12 +1984,13 @@ def concat_clips(
             f"[{i}:v]setpts=PTS-STARTPTS,"
             f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
             f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=0x0A0C12,"
-            f"fps={rate:.3f},setsar=1,format=yuv420p[v{i}];"
+            f"fps={rate:.3f},setsar=1,{VIDEO_TO_BT709}[v{i}];"
         )
         if clip_info["has_audio"]:
             filter_parts.append(
                 f"[{i}:a]asetpts=PTS-STARTPTS,"
-                f"aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[a{i}];"
+                f"aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
+                f"aresample=async=1:first_pts=0[a{i}];"
             )
         elif silent_idx is not None and i == 0:
             filter_parts.append(
@@ -1783,6 +2017,7 @@ def concat_clips(
         preset,
         "-crf",
         str(crf),
+        *X264_BT709,
         "-c:a",
         "aac",
         "-b:a",
@@ -1844,7 +2079,8 @@ def overlay_then_concat(
         cmd += ["-i", str(sting)]
     if info["has_audio"]:
         game_src = (
-            "[0:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[game];"
+            "[0:a]aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo,"
+            "aresample=async=1:first_pts=0[game];"
         )
     else:
         game_src = (
@@ -1865,12 +2101,12 @@ def overlay_then_concat(
         f"[0:v][ov]overlay=0:0:format=auto:eof_action=pass,setpts=PTS-STARTPTS,"
         f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
         f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=0x0A0C12,"
-        f"fps={rate:.3f},setsar=1,format=yuv420p[v0];"
+        f"fps={rate:.3f},setsar=1,{VIDEO_TO_BT709}[v0];"
         f"{game_a}"
         f"[2:v]setpts=PTS-STARTPTS,"
         f"scale={w}:{h}:force_original_aspect_ratio=decrease,"
         f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=0x0A0C12,"
-        f"fps={rate:.3f},setsar=1,format=yuv420p[v1];"
+        f"fps={rate:.3f},setsar=1,{VIDEO_TO_BT709}[v1];"
         f"[2:a]asetpts=PTS-STARTPTS,"
         f"aformat=sample_fmts=fltp:sample_rates=48000:channel_layouts=stereo[a1];"
         f"[v0][a0][v1][a1]concat=n=2:v=1:a=1[v][a]"
@@ -1888,6 +2124,7 @@ def overlay_then_concat(
         preset,
         "-crf",
         str(crf),
+        *X264_BT709,
         "-c:a",
         "aac",
         "-b:a",
@@ -2101,8 +2338,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--overlay-y",
         type=int,
-        default=1180,
-        help="Vertical center of the overlay on 1080x1920 (default: 1180)",
+        default=OVERLAY_ROAD_CY,
+        help=f"Vertical center of the overlay on 1080x1920 (default: {OVERLAY_ROAD_CY})",
     )
     p.add_argument(
         "--overlay-variants",

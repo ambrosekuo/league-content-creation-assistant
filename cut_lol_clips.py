@@ -540,6 +540,14 @@ def main(argv: list[str] | None = None) -> int:
                     content_type="application/json",
                 )
 
+        def clip_already_done(output: Path) -> bool:
+            if output.is_file() and output.stat().st_size > 10_000:
+                return True
+            if publish and gcs_mod is not None:
+                rel_ds = output.relative_to(dataset_dir).as_posix()
+                return gcs_mod.blob_exists(f"{gcs_base}/{rel_ds}")
+            return False
+
         for index, window in enumerate(windows, start=1):
             rel = clip_relpath(window)
             output = out_dir / rel
@@ -552,9 +560,10 @@ def main(argv: list[str] | None = None) -> int:
             )
             window_start = max(0.0, float(window["start"]) - timeline_offset)
             window_end = max(window_start + 0.1, float(window["end"]) - timeline_offset)
-            reused = args.resume and output.is_file() and output.stat().st_size > 10_000
+            reused = args.resume and clip_already_done(output)
             if reused:
-                print(f"[{index}/{len(windows)}] skip (exists) {rel}", flush=True)
+                where = "local" if output.is_file() else "gcs"
+                print(f"[{index}/{len(windows)}] skip ({where}) {rel}", flush=True)
                 skipped += 1
             else:
                 print(
@@ -580,6 +589,8 @@ def main(argv: list[str] | None = None) -> int:
                         f"{gcs_base}/{rel_ds}",
                         content_type="video/mp4",
                     )
+                    # Free ephemeral disk — resume checks GCS, not local copies.
+                    output.unlink(missing_ok=True)
 
             clips.append(
                 {

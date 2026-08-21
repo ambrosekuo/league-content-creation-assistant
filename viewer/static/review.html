@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Clip review</title>
+  <link rel="stylesheet" href="/static/review.css?v=hooks2" />
+</head>
+<body>
+    <header class="top">
+    <div class="brand">
+      <button type="button" id="btn-days" class="day-switch" aria-expanded="false" aria-controls="day-nav">
+        <span class="chevron" aria-hidden="true">☰</span>
+        <div>
+          <h1 id="day-title">Clip review</h1>
+          <p id="source-line">loading…</p>
+        </div>
+      </button>
+    </div>
+    <div class="top-actions">
+      <a id="btn-archive" class="ghost" href="/">Archive</a>
+      <button type="button" id="btn-sync-local" class="ghost hidden">Sync local</button>
+      <button type="button" id="btn-play-day" class="ghost">Play Day</button>
+    </div>
+  </header>
+
+  <div id="day-nav" class="day-nav hidden">
+    <div class="day-nav-backdrop" id="day-nav-backdrop"></div>
+    <aside class="day-nav-panel" role="navigation" aria-label="Days">
+      <p class="day-nav-head">Days</p>
+      <div id="day-list"></div>
+    </aside>
+  </div>
+
+  <div id="summary" class="summary"></div>
+
+  <div class="export-bar">
+    <p id="export-hint" class="muted">Rate clips godly / excellent, then stitch per game, portraits, decorate, and music.</p>
+    <div class="export-actions">
+      <button type="button" id="btn-sync-picks" class="ghost hidden">Sync picks</button>
+      <button type="button" id="btn-stitch" class="primary hidden" disabled>Stitch</button>
+      <button type="button" id="btn-portraits" class="primary hidden" disabled>Make portraits</button>
+      <button type="button" id="btn-decorate" class="primary hidden" disabled>Decorate</button>
+      <label id="track-pick-wrap" class="track-pick-wrap hidden">
+        <span>Track</span>
+        <select id="track-pick" aria-label="Music track"></select>
+        <button type="button" id="btn-track-preview" class="ghost btn-track-preview" title="Preview track" aria-label="Preview track">▶</button>
+      </label>
+      <button type="button" id="btn-music" class="primary hidden" disabled>Add music</button>
+      <button type="button" id="btn-generate-titles" class="primary hidden" disabled>Generate titles</button>
+      <div id="post-platforms" class="post-platforms hidden">
+        <label class="toggle"><input type="checkbox" id="post-youtube" /> YouTube</label>
+        <label class="toggle"><input type="checkbox" id="post-tiktok" /> TikTok</label>
+      </div>
+      <button type="button" id="btn-sync-post-titles" class="ghost hidden">Sync titles</button>
+      <button type="button" id="btn-post" class="primary hidden" disabled>Post</button>
+      <button type="button" id="btn-refresh-exports" class="ghost hidden">Refresh</button>
+    </div>
+  </div>
+  <pre id="job-out" class="job-out hidden"></pre>
+
+  <div class="source-tabs" id="source-tabs"></div>
+
+  <div class="view-tabs" id="view-tabs"></div>
+
+  <div class="toolbar" id="toolbar">
+    <input type="search" id="matchup-search" class="matchup-search" placeholder="Champion vs opponent" aria-label="Search by champion matchup" autocomplete="off" spellcheck="false" />
+    <div class="chips" id="filter-rating"></div>
+    <div class="chips" id="filter-classification"></div>
+    <div class="chips" id="filter-game"></div>
+    <div class="chips" id="filter-event"></div>
+    <div class="toolbar-end">
+      <label class="toggle">
+        <input type="checkbox" id="auto-advance" checked />
+        Auto advance after rating
+      </label>
+      <div class="seg" id="speed-seg">
+        <button type="button" data-speed="1" class="on">1x</button>
+        <button type="button" data-speed="1.25">1.25x</button>
+        <button type="button" data-speed="1.5">1.5x</button>
+        <button type="button" data-speed="2">2x</button>
+      </div>
+    </div>
+  </div>
+
+  <main class="stage">
+    <div id="grid" class="grid"></div>
+    <div id="classifications-view" class="classifications-view hidden"></div>
+    <div id="titles-view" class="titles-view hidden"></div>
+    <div id="post-view" class="titles-view post-view hidden"></div>
+    <p id="empty" class="empty hidden">No clips match this filter.</p>
+  </main>
+
+  <div id="player-mode" class="player-mode hidden">
+    <div class="player-shell">
+      <div class="player-frame">
+        <video id="player" controls playsinline></video>
+        <video id="preload" playsinline muted class="hidden"></video>
+      </div>
+      <div class="player-meta">
+        <p id="player-index" class="mono"></p>
+        <h2 id="player-title"></h2>
+        <p id="player-sub" class="muted"></p>
+        <p id="player-place" class="muted"></p>
+        <button type="button" id="btn-reveal-local" class="ghost hidden">Show in Finder</button>
+        <p id="player-time" class="mono"></p>
+        <p id="player-rating" class="rating-line">unreviewed</p>
+        <div class="seg seek-row" id="seek-row">
+          <button type="button" data-seek="-3">−3s</button>
+          <button type="button" data-seek="3">+3s</button>
+        </div>
+        <div class="seg seek-row" id="trim-row">
+          <button type="button" id="btn-mark-in">[ in</button>
+          <button type="button" id="btn-mark-out">] out</button>
+          <button type="button" id="btn-trim" class="primary" disabled>Cut</button>
+          <button type="button" id="btn-uncut" class="ghost" disabled>Uncut</button>
+        </div>
+        <p id="trim-line" class="muted">in — · out —</p>
+        <div class="rate-row" id="rate-row">
+          <button type="button" data-rating="reject">1 Reject</button>
+          <button type="button" data-rating="keep">2 Keep</button>
+          <button type="button" data-rating="excellent">3 Excellent</button>
+          <button type="button" data-rating="godly">5 Godly</button>
+          <button type="button" data-rating="manual_edit">4 Edit</button>
+          <button type="button" data-rating="clear" class="ghost">0 Clear</button>
+        </div>
+        <section id="classification-panel" class="classification-panel">
+          <p class="classification-head">Classification</p>
+          <div id="classification-body"></div>
+        </section>
+        <section id="title-panel" class="title-panel hidden">
+          <p class="classification-head">Upload hooks</p>
+          <div id="title-body"></div>
+        </section>
+        <p class="hint">←/→ ±3s · [ in · ] out · c cut · u uncut · j/k clip · space play · f fullscreen · esc grid</p>
+      </div>
+    </div>
+  </div>
+
+  <audio id="track-preview" preload="none"></audio>
+  <script src="/static/review.js?v=hooks6"></script>
+</body>
+</html>

@@ -1,5 +1,7 @@
 # Twitch VOD Ingestion Starter
 
+End-to-end usage is in **[USAGE.md](USAGE.md)**. Default export is **reviewed picks** (rate in the review browser, then local Portraits → Decorate). Auto stitch is optional.
+
 This is the first stage of the LolAmbrosek clip pipeline:
 
 ```text
@@ -35,6 +37,23 @@ python -m viewer
 
 Opens at http://127.0.0.1:8787. Playback prefers local files; GCS-only objects can be pulled to `data/` first. Notes and keep/skip flags live in `data/_viewer/reviews.json`.
 
+Clip review (individual event clips, not game weaves) is a separate page:
+
+```text
+http://127.0.0.1:8787/review/{vodId}
+http://127.0.0.1:8787/review/{dayKey}/{vodId}
+http://127.0.0.1:8787/review/aug15_2026/2847370420?filter=unreviewed
+```
+
+Keys: `1` reject · `2` keep · `3` excellent · `5` godly · `4` manual edit · `0` clear · `j`/`k` next/prev · space play · `f` fullscreen. Ratings save immediately to `data/_viewer/{dayKey}_{vodId}/selections.json` and `approved/{godly,excellent,keep,manual_edit,rejected}.json`. Default compilations use godly + excellent only.
+
+Sync clips locally first, then **Portraits** (stitch + dry 9:16) and **Decorate** on the review page. Same as:
+
+```bash
+python review_export.py --dataset-dir data/{day}_{vodId}
+python decorate_portrait.py --dataset-dir data/{day}_{vodId} --from-picks
+```
+
 ## Local soundbytes (Freesound CC0)
 
 `assets/stings/inbox/` is the drop folder for sounds you pick. `assets/stings/suggested/` is dopamine-like CC0 picks (cash register, coin). `assets/stings/intro/` is intro / ident stings only.
@@ -53,6 +72,61 @@ python fetch_stings.py --adopt ~/Downloads/209578__zott820__cash-register-purcha
 python fetch_gifs.py --list
 python fetch_gifs.py --suggest
 python fetch_gifs.py --adopt ~/Downloads/some.gif
+```
+
+## Music pool (automated clips)
+
+Don't hunt 500 stock tracks. Curate **20–40 vetted songs** in `assets/music/pool.json`, tag them with mood / energy / clip categories, and let the pipeline pick per classification.
+
+**Where to source (best → fallback):**
+
+| Source | Use for | Notes |
+|--------|---------|-------|
+| [Uppbeat](https://uppbeat.io/) | Short-form exports | Creator-focused; TikTok/YouTube/Twitch/IG. Search phonk, hyperpop, trap, jersey club, glitch, cyberpunk — not "gaming". |
+| [StreamBeats](https://streambeats.com/) | Free starting library | 1,700+ tracks, sync license for streams/videos. Dig Hip-Hop → EDM → Hifi → Synthwave. |
+| [Pretzel Rocks](https://pretzel.rocks/) | Live stream beds | Huge Twitch-safe catalog; double-check YouTube before baking into hundreds of automated exports. |
+| Mixkit | Fallback / placeholders | Skews corporate vlog / 2018 montage. Lofi beds only via `fetch_music.py`. |
+
+**Clip type → music direction** (encoded in `music_pool.py`):
+
+| Clip type | Direction |
+|-----------|-----------|
+| outplay | dark trap / phonk / aggressive electronic |
+| multikill | bass / trap / EDM |
+| chase | DnB / high-BPM electronic |
+| mistake | goofy electronic / jersey / bounce |
+| reaction | very minimal beat |
+| game_end | atmospheric / melodic electronic |
+| ordinary | modern lo-fi / chill trap |
+
+Drop downloads into `assets/music/inbox/`, adopt with tags, then the render path can do: **classification → pool pick → mix → export**.
+
+Portrait renders (`render_portrait.py`, `cloud_job.py process-portraits`) stay **dry** (facecam + gameplay + KDA + blur bars; `--intro none --no-outro --music off`). Decoration is a second job:
+
+```bash
+python decorate_portrait.py --dataset-dir data/{day}_{vodId} --only gam14
+# or: python cloud_job.py process-decorate-portraits --vod-id VIDEO_ID --dataset-dir data/{day}_{vodId}
+```
+
+That adds combos (from the landscape weave), captions, and the road-to-Challenger intro + rank-card outro onto `*_portrait_decorated.mp4`. Music is a later step:
+
+```bash
+python mix_portrait_music.py --dataset-dir data/{day}_{vodId} --from-picks --track a-game
+```
+
+```bash
+python music_pool.py                                    # pool status + category coverage
+python music_pool.py --pick outplay                     # test selection
+python music_pool.py --mix clip.mp4 --category multikill
+python music_pool.py --adopt ~/Downloads/phonk.mp3 \
+  --id dark-phonk-01 --source uppbeat --license uppbeat-free \
+  --energy 0.85 --categories outplay,multikill --mood dark,aggressive --bpm 142
+```
+
+Legacy Mixkit lofi fetcher (optional `--music lofi` on portraits):
+
+```bash
+python fetch_music.py --suggest                         # lofi → assets/music/suggested/
 ```
 
 ## Do I need to download the whole VOD?

@@ -139,12 +139,15 @@ def load_vod_timeline(vod_dir: Path) -> dict[str, Any]:
         else None
     )
 
+    from dataset_paths import vod_id_from_dir_name
+
+    vod_id = vod_id_from_dir_name(vod_dir.name)
     return {
-        "datasetId": metadata.get("id") or vod_dir.name,
+        "datasetId": metadata.get("id") or vod_id,
         "title": metadata.get("title"),
         "uploader": metadata.get("uploader") or metadata.get("uploader_id"),
         "url": metadata.get("webpage_url")
-        or f"https://www.twitch.tv/videos/{vod_dir.name.lstrip('v')}",
+        or f"https://www.twitch.tv/videos/{vod_id}",
         "start": start,
         "end": end,
         "durationSeconds": duration_seconds,

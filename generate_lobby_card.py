@@ -283,6 +283,56 @@ def tier_wings(tier: str):
     return im
 
 
+def challenger_crown():
+    """Ornate Challenger emblem used as a crown over callout tiles."""
+    im = tier_emblem("CHALLENGER")
+    if im is None:
+        # Fallback: flat mini crest.
+        data = cached_bytes(f"{CDRAGON}/ranked-mini-crests/challenger.png")
+        if not data:
+            return None
+        im = open_rgba(data)
+        if im is None:
+            return None
+    px = im.load()
+    for y in range(im.height):
+        for x in range(im.width):
+            r, g, b, a = px[x, y]
+            if a and r < 18 and g < 18 and b < 18:
+                px[x, y] = (0, 0, 0, 0)
+    bbox = im.getbbox()
+    return im.crop(bbox) if bbox else im
+
+
+def attach_challenger_ladder_ranks(
+    rows: list[dict[str, Any]],
+    *,
+    platform: str = "na1",
+) -> list[dict[str, Any]]:
+    """Stamp live Challenger ladder standing onto Challenger lobby rows."""
+    if not any(str(r.get("tier") or "").upper() == "CHALLENGER" for r in rows):
+        return rows
+    try:
+        from render_rank_cards import challenger_ladder_rank, fetch_challenger_ladder_lps
+
+        ladder = fetch_challenger_ladder_lps(platform=platform)
+    except Exception as exc:
+        print(f"[lobby] ladder ranks skipped: {exc}", flush=True)
+        return rows
+    out: list[dict[str, Any]] = []
+    for row in rows:
+        item = dict(row)
+        if str(item.get("tier") or "").upper() == "CHALLENGER":
+            rank = challenger_ladder_rank(item.get("lp"), ladder)
+            item["ladderRank"] = rank
+            if rank is not None:
+                lp = item.get("lp")
+                lp_bit = f" · {int(lp)} LP" if lp is not None else ""
+                item["rankLabel"] = f"RANK {int(rank)}{lp_bit}"
+        out.append(item)
+    return out
+
+
 def paste_center(base, overlay, cx: int, cy: int, size: tuple[int, int] | None = None) -> None:
     from PIL import Image
 
@@ -623,8 +673,11 @@ def render_lobby_card(
     highlight_name: str | None = None,
     width: int = 1920,
     height: int = 1080,
+    platform: str = "na1",
 ) -> Path:
     from PIL import Image, ImageDraw, ImageFont, ImageFilter
+
+    rows = attach_challenger_ladder_ranks(rows, platform=platform)
 
     canvas = Image.new("RGBA", (width, height), (8, 10, 18, 255))
     draw = ImageDraw.Draw(canvas)
@@ -715,6 +768,40 @@ def render_lobby_card(
             eh = int(ew * emblem.height / max(1, emblem.width))
             paste_center(card, emblem, badge_cx, badge_cy, (ew, eh))
 
+        ladder_rank = player.get("ladderRank")
+        if tier == "CHALLENGER":
+            crown = challenger_crown()
+            if crown is not None:
+                crown_size = 58
+                paste_center(card, crown, cw // 2, 34, (crown_size, crown_size))
+            if ladder_rank is not None:
+                from PIL import ImageFont
+
+                rank_tag = f"RANK {int(ladder_rank)}"
+                try:
+                    tag_font = ImageFont.truetype(font_path_bold, 16)
+                except OSError:
+                    tag_font = ImageFont.load_default()
+                cd = ImageDraw.Draw(card)
+                tb = cd.textbbox((0, 0), rank_tag, font=tag_font)
+                tw = tb[2] - tb[0]
+                th = tb[3] - tb[1]
+                tx = (cw - tw) // 2
+                ty = 62
+                pad = 5
+                cd.rounded_rectangle(
+                    (tx - pad, ty - 2, tx + tw + pad, ty + th + 4),
+                    radius=8,
+                    fill=(6, 10, 18, 200),
+                )
+                cd.text((tx + 1, ty + 1), rank_tag, fill=(0, 0, 0, 220), font=tag_font)
+                cd.text(
+                    (tx, ty),
+                    rank_tag,
+                    fill=TIER_COLORS["CHALLENGER"] + (255,),
+                    font=tag_font,
+                )
+
         shadow = Image.new("RGBA", (cw + 16, ch + 16), (0, 0, 0, 0))
         sd = ImageDraw.Draw(shadow)
         sd.rectangle([6, 8, cw + 6, ch + 8], fill=(0, 0, 0, 110))
@@ -750,6 +837,10 @@ def render_lobby_card(
         frame.text((nx, ny), name, fill=name_fill, font=name_font)
 
         rank_label = str(player.get("rankLabel") or "")
+        if tier == "CHALLENGER" and ladder_rank is not None:
+            lp = player.get("lp")
+            lp_bit = f" · {int(lp)} LP" if lp is not None else ""
+            rank_label = f"RANK {int(ladder_rank)}{lp_bit}"
         if rank_label:
             rank_text, rank_font = fit_text(
                 frame,
@@ -835,6 +926,7 @@ def main(argv: list[str] | None = None) -> int:
         rows,
         output=args.output.resolve(),
         highlight_name=highlight or None,
+        platform=platform,
     )
     print(
         json.dumps(

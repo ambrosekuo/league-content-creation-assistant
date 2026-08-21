@@ -12,9 +12,9 @@ Layout (default):
 
 Calibrate --cam-* / --kda-* once from a mid-frame; both are assumed static.
 
-Default intro is a 2s road-to-Challenger overlay on the first gameplay
-seconds (plus sparkle sting), then the rank-card outro after the weave.
-The old lobby story (--intro story --still-seconds 3) is kept but unused.
+Default is a dry layout only (facecam + gameplay + KDA + blur bars).
+Intro overlay, rank-card outro, captions, combos, and music belong to
+decorate_portrait.py.
 """
 
 from __future__ import annotations
@@ -26,6 +26,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from ffmpeg_color import VIDEO_TO_BT709, X264_BT709
+
 
 def run(cmd: list[str]) -> None:
     print("+", " ".join(cmd), flush=True)
@@ -33,6 +35,51 @@ def run(cmd: list[str]) -> None:
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "").strip()
         raise RuntimeError(f"Command failed ({proc.returncode}): {' '.join(cmd)}\n{detail}")
+
+
+def _parse_fps_rate(rate: str) -> float | None:
+    if not rate or rate in {"0/0", "N/A"}:
+        return None
+    if "/" not in rate:
+        try:
+            fps = float(rate)
+        except ValueError:
+            return None
+    else:
+        num, den = rate.split("/", 1)
+        try:
+            fps = float(num) / max(float(den), 1.0)
+        except ValueError:
+            return None
+    if fps <= 1.0:
+        return None
+    return fps
+
+
+def _fps_from_stream(stream: dict[str, Any], *, duration: float | None = None) -> float:
+    """Pick output fps without upsampling sparse copy-concat weaves."""
+    avg = _parse_fps_rate(str(stream.get("avg_frame_rate") or ""))
+    nominal = _parse_fps_rate(str(stream.get("r_frame_rate") or ""))
+
+    effective: float | None = None
+    nb = stream.get("nb_frames")
+    dur = duration if duration is not None else stream.get("duration")
+    if nb is not None and dur:
+        try:
+            effective = int(nb) / max(float(dur), 0.001)
+        except (TypeError, ValueError):
+            effective = None
+
+    # Long copy-concat weaves keep ~60 r_frame_rate but store far too few packets.
+    if effective and effective > 1.0:
+        if nominal and nominal >= 29.5 and effective < nominal * 0.5:
+            return max(1.0, min(effective, 60.0))
+
+    if avg:
+        return max(1.0, min(avg, 60.0))
+    if nominal:
+        return max(1.0, min(nominal, 60.0))
+    return 30.0
 
 
 def probe(path: Path) -> dict[str, Any]:
@@ -46,7 +93,7 @@ def probe(path: Path) -> dict[str, Any]:
             "-select_streams",
             "v:0",
             "-show_entries",
-            "stream=width,height,r_frame_rate",
+            "stream=width,height,r_frame_rate,avg_frame_rate,nb_frames",
             "-of",
             "json",
             str(path),
@@ -59,19 +106,11 @@ def probe(path: Path) -> dict[str, Any]:
     data = json.loads(proc.stdout or "{}")
     stream = (data.get("streams") or [{}])[0]
     duration = float((data.get("format") or {}).get("duration") or 0.0)
-    rate = str(stream.get("r_frame_rate") or "30/1")
-    fps = 30.0
-    if "/" in rate:
-        num, den = rate.split("/", 1)
-        try:
-            fps = float(num) / max(float(den), 1.0)
-        except ValueError:
-            fps = 30.0
     return {
         "width": int(stream.get("width") or 1920),
         "height": int(stream.get("height") or 1080),
         "duration": duration,
-        "fps": max(1.0, min(fps, 60.0)),
+        "fps": _fps_from_stream(stream, duration=duration),
     }
 
 
@@ -209,7 +248,7 @@ def still_fit_vf(
         return (
             f"scale={out_w}:{out_h}:force_original_aspect_ratio=increase,"
             f"crop={out_w}:{out_h},"
-            f"setsar=1,format=yuv420p"
+            f"setsar=1,{VIDEO_TO_BT709}"
         )
     if mode in {"champs", "cards", "content"}:
         crop_x, crop_y, crop_w, crop_h = still_champs_crop(src_w, src_h)
@@ -217,12 +256,12 @@ def still_fit_vf(
             f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y},"
             f"scale={out_w}:{out_h}:force_original_aspect_ratio=decrease,"
             f"pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2:color={STILL_PAD_COLOR},"
-            f"setsar=1,format=yuv420p"
+            f"setsar=1,{VIDEO_TO_BT709}"
         )
     return (
         f"scale={out_w}:{out_h}:force_original_aspect_ratio=decrease,"
         f"pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2:color={STILL_PAD_COLOR},"
-        f"setsar=1,format=yuv420p"
+        f"setsar=1,{VIDEO_TO_BT709}"
     )
 
 
@@ -343,13 +382,27 @@ def contain_pad_top(src_w: int, src_h: int, dst_w: int, dst_h: int) -> int:
     return max(0, (dst_h - fit_h) // 2)
 
 
+def _fast_blur_chain(dst_w: int, dst_h: int, *, luma: int = 6, chroma: int = 2) -> str:
+    """Blur at ~1/4 res then scale back. Same look as full-frame boxblur, much cheaper."""
+    sw = max(2, even(dst_w // 4))
+    sh = max(2, even(dst_h // 4))
+    return (
+        f"scale={sw}:{sh},"
+        f"boxblur={luma}:{chroma},"
+        f"scale={dst_w}:{dst_h}"
+    )
+
+
 def contain_with_blur_vf(dst_w: int, dst_h: int) -> str:
-    """Fit into dst; fill empty bands with a blurred cover crop of the same frame."""
+    """Fit into dst; fill empty bands with a blurred cover crop of the same frame.
+
+    Blur runs at ~1/4 resolution so game_zoom < 1.0 stays usable on Cloud Run.
+    """
     return (
         f"split=2[gbg][gfg];"
         f"[gbg]scale={dst_w}:{dst_h}:force_original_aspect_ratio=increase,"
         f"crop={dst_w}:{dst_h},"
-        f"boxblur=22:6[gblur];"
+        f"{_fast_blur_chain(dst_w, dst_h, luma=6, chroma=2)}[gblur];"
         f"[gfg]scale={dst_w}:{dst_h}:force_original_aspect_ratio=decrease[gfit];"
         f"[gblur][gfit]overlay=(W-w)/2:(H-h)/2,setsar=1"
     )
@@ -376,12 +429,11 @@ def cam_hole_prefix(
         return (
             f"split=2[gh][gf];"
             f"[gf]crop={cam_w}:{cam_h}:{cam_x}:{fy},"
-            f"scale={cam_w}:{cam_h},boxblur=10:2[hole];"
+            f"{_fast_blur_chain(cam_w, cam_h, luma=4, chroma=1)}[hole];"
             f"[gh][hole]overlay=x={cam_x}:y={cam_y}[gfilled];"
             f"[gfilled]"
         )
     return f"drawbox=x={cam_x}:y={cam_y}:w={cam_w}:h={cam_h}:color=black:t=fill,"
-
 
 def cam_stack_parts(
     *,
@@ -507,6 +559,7 @@ def build_filter(
     kda_h: int = 32,
     kda_out_w: int = 560,
     kda_margin: int = 0,
+    include_audio: bool = True,
 ) -> str:
     """Build filter graph with optional lobby still + KDA PIP overlay."""
     out_w = even(out_w)
@@ -554,6 +607,7 @@ def build_filter(
 
     def stack_with_optional_kda(split_n: int, cam_label: str, game_label: str, kda_label: str | None) -> str:
         """cam+game vstack, optionally overlay KDA PIP on the gameplay video."""
+        fps_s = f"{max(1.0, float(fps)):.3f}"
         body = (
             f"[{cam_label}]{cam_vf}[cam];"
             f"[{game_label}]{game_vf}[game];"
@@ -562,24 +616,33 @@ def build_filter(
             body += (
                 f"[{kda_label}]{kda_vf}[kda];"
                 f"[game][kda]overlay=x=main_w-overlay_w-{max(0, kda_margin)}:y={kda_ov_y}:format=auto[gk];"
-                f"[cam][gk]vstack=inputs=2,format=yuv420p[v]"
+                f"[cam][gk]vstack=inputs=2,fps={fps_s},{VIDEO_TO_BT709}[v]"
             )
         else:
-            body += f"[cam][game]vstack=inputs=2,format=yuv420p[v]"
+            body += f"[cam][game]vstack=inputs=2,fps={fps_s},{VIDEO_TO_BT709}[v]"
         return body
 
     if still_s <= 0:
+        audio = ""
+        if include_audio:
+            audio = (
+                ";[0:a]aformat=sample_rates=48000:channel_layouts=stereo,"
+                "aresample=async=1:first_pts=0[a]"
+            )
         if kda_overlay:
             return (
                 f"[0:v]split=3[cam_src][game_src][kda_src];"
                 + stack_with_optional_kda(3, "cam_src", "game_src", "kda_src")
+                + audio
             )
         return (
             f"[0:v]split=2[cam_src][game_src];"
             + stack_with_optional_kda(2, "cam_src", "game_src", None)
+            + audio
         )
 
     play_head = "[0:v]" if still_from_input is not None else "[v_play]"
+    fps_s = f"{max(1.0, float(fps)):.3f}"
     if kda_overlay:
         play = (
             f"{play_head}trim=start={skip_s:.3f},setpts=PTS-STARTPTS,split=3[cam_src][game_src][kda_src];"
@@ -587,29 +650,29 @@ def build_filter(
             f"[game_src]{game_vf}[game];"
             f"[kda_src]{kda_vf}[kda];"
             f"[game][kda]overlay=x=main_w-overlay_w-{max(0, kda_margin)}:y={kda_ov_y}:format=auto[gk];"
-            f"[cam][gk]vstack=inputs=2,format=yuv420p[play]"
+            f"[cam][gk]vstack=inputs=2,fps={fps_s},{VIDEO_TO_BT709}[play]"
         )
     else:
         play = (
             f"{play_head}trim=start={skip_s:.3f},setpts=PTS-STARTPTS,split=2[cam_src][game_src];"
             f"[cam_src]{cam_vf}[cam];"
             f"[game_src]{game_vf}[game];"
-            f"[cam][game]vstack=inputs=2,format=yuv420p[play]"
+            f"[cam][game]vstack=inputs=2,fps={fps_s},{VIDEO_TO_BT709}[play]"
         )
 
     if still_from_input is not None:
         idx = int(still_from_input)
-        fps_s = f"{max(1.0, float(fps)):.3f}"
         still = (
             f"[{idx}:v]scale={out_w}:{out_h}:force_original_aspect_ratio=decrease,"
             f"pad={out_w}:{out_h}:(ow-iw)/2:(oh-ih)/2:color={STILL_PAD_COLOR},"
-            f"setsar=1,fps={fps_s},format=yuv420p,"
+            f"setsar=1,fps={fps_s},{VIDEO_TO_BT709},"
             f"trim=duration={still_s:.3f},setpts=PTS-STARTPTS[still];"
         )
         return still + play + ";[still][play]concat=n=2:v=1:a=0[v]" + (
             f";anullsrc=r=48000:cl=stereo:d={still_s:.3f}[asilent];"
             f"[0:a]atrim=start={skip_s:.3f},asetpts=PTS-STARTPTS,"
-            f"aformat=sample_rates=48000:channel_layouts=stereo[agame];"
+            f"aformat=sample_rates=48000:channel_layouts=stereo,"
+            f"aresample=async=1:first_pts=0[agame];"
             f"[asilent][agame]concat=n=2:v=0:a=1[a]"
             if still_from_input is not None
             else ""
@@ -664,11 +727,11 @@ def render_portrait(
     track_pan_cooldown: float = 3.0,
     track_outside_hold: float = 1.5,
     track_debug_dir: Path | None = None,
-    intro: str = "overlay",
-    outro: bool = True,
+    intro: str = "none",
+    outro: bool = False,
     overlay_hold: float = 2.0,
     end_seconds: float = 2.5,
-    music: str = "auto",
+    music: str = "off",
     music_db: float = -20.0,
 ) -> dict[str, Any]:
     intro_mode = str(intro or "overlay").strip().lower()
@@ -714,6 +777,7 @@ def render_portrait(
         kda_h=kda_h,
         kda_out_w=kda_out_w,
         kda_margin=kda_margin,
+        fps=float(info["fps"]),
     )
     track_report: dict[str, Any] | None = None
     if track_champion:
@@ -821,7 +885,9 @@ def render_portrait(
                 else:
                     break
             preview_kwargs["crop_x"] = crop_at
-        preview_filt = build_filter(still_seconds=0.0, **preview_kwargs)
+        preview_filt = build_filter(
+            still_seconds=0.0, include_audio=False, **preview_kwargs
+        )
         run(
             [
                 "ffmpeg",
@@ -856,6 +922,8 @@ def render_portrait(
     ]
     if story_mp4 is not None and "[a]" in filt:
         cmd += ["-map", "[a]"]
+    elif "[a]" in filt:
+        cmd += ["-map", "[a]"]
     else:
         cmd += ["-map", "0:a?"]
     cmd += [
@@ -865,6 +933,7 @@ def render_portrait(
         preset,
         "-crf",
         str(crf),
+        *X264_BT709,
         "-threads",
         "0",
         "-c:a",
@@ -909,10 +978,37 @@ def render_portrait(
     music_report: dict[str, Any] | None = None
     music_mode = str(music or "auto").strip().lower()
     if music_mode not in {"off", "none", "false", "0"}:
-        from fetch_music import mix_into, resolve_or_pick
+        if music_mode.startswith("lofi") or music_mode.startswith("bed"):
+            from fetch_music import mix_into, resolve_or_pick
 
-        chosen = resolve_or_pick(music_mode)
-        music_report = mix_into(output, chosen, music_db=float(music_db))
+            bed_query = "auto"
+            if ":" in music_mode:
+                bed_query = music_mode.split(":", 1)[1].strip() or "auto"
+            chosen = resolve_or_pick(bed_query)
+            music_report = mix_into(output, chosen, music_db=float(music_db))
+        else:
+            from music_pool import enabled_tracks, mix_pool_into, resolve_pool_track
+
+            pool_category = "multikill"
+            pool_query = music_mode
+            if music_mode.startswith("pool"):
+                rest = music_mode.split(":", 1)[1].strip() if ":" in music_mode else "auto"
+                known_ids = {str(t.get("id")).lower() for t in enabled_tracks()}
+                if rest and rest not in {"", "auto", "random"} and rest not in known_ids:
+                    pool_category = rest
+                    pool_query = "auto"
+                else:
+                    pool_query = rest or "auto"
+            elif music_mode in {"auto", "random"}:
+                pool_query = "auto"
+
+            chosen = resolve_pool_track(pool_query, category=pool_category)
+            music_report = mix_pool_into(
+                output,
+                chosen,
+                category=pool_category,
+                music_db=float(music_db),
+            )
 
     out_info = probe(output)
     return {
@@ -966,15 +1062,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--intro",
         choices=("overlay", "story", "none"),
-        default="overlay",
-        help="Opening: overlay=road-to-Challenger on gameplay (default), "
-        "story=deprecated lobby card, none=gameplay only",
+        default="none",
+        help="Opening: none=dry layout (default). overlay/story belong on decorate_portrait.py",
     )
     p.add_argument(
         "--outro",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Append the rank-card end outro (default: on)",
+        default=False,
+        help="Append the rank-card end outro (default: off; use decorate_portrait.py)",
     )
     p.add_argument(
         "--overlay-hold",
@@ -1109,14 +1204,15 @@ def build_parser() -> argparse.ArgumentParser:
     )
     p.add_argument(
         "--music",
-        default="auto",
-        help="Lofi bed: auto=random catalog pick (default), off, or a catalog id",
+        default="off",
+        help="Music bed: off (default; caption first, then mix), auto=pool pick, "
+        "pool[:category], track id, lofi[:id]",
     )
     p.add_argument(
         "--music-db",
         type=float,
-        default=-20.0,
-        help="Music bed level vs game audio (default -20)",
+        default=-18.0,
+        help="Music bed level vs game audio (default -18)",
     )
     return p
 

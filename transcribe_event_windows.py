@@ -10,12 +10,24 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+from asr import (
+    DEFAULT_WHISPER_MODEL,
+    build_prompt,
+    default_model_for,
+    matchup_from_name,
+    resolve_engine,
+    transcribe_words,
+    words_to_segments,
+)
+from env_loader import load_dotenv
 
 
 def load_json(path: Path) -> dict[str, Any]:
@@ -121,7 +133,35 @@ def build_parser() -> argparse.ArgumentParser:
         default=45.0,
         help="Merge nearby event anchors into one whisper window",
     )
-    p.add_argument("--model", default="small.en")
+    p.add_argument(
+        "--asr",
+        dest="asr_engine",
+        default=None,
+        choices=("whisper", "openai"),
+        help="ASR engine. Default: $TRANSCRIBE_ASR or local whisper",
+    )
+    p.add_argument(
+        "--model",
+        default=None,
+        help="ASR model. Default: small.en (whisper) or gpt-4o-mini-transcribe (openai)",
+    )
+    p.add_argument(
+        "--prompt",
+        dest="asr_prompt",
+        default="",
+        help="Extra ASR prompt (League terms are added automatically)",
+    )
+    p.add_argument(
+        "--align",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="When --asr openai, time words with local Whisper (default: on)",
+    )
+    p.add_argument(
+        "--align-model",
+        default=DEFAULT_WHISPER_MODEL,
+        help="Local Whisper model used only to time OpenAI words",
+    )
     p.add_argument("--language", default="en")
     p.add_argument("--device", default="cpu", choices=["cpu", "cuda", "auto"])
     p.add_argument("--compute-type", default="int8")
@@ -148,10 +188,16 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    load_dotenv()
     args = build_parser().parse_args(argv)
     dataset_dir = args.dataset_dir.resolve()
     events_path = (args.events or dataset_dir / "lol_events.json").resolve()
     transcript_path = dataset_dir / "transcript.json"
+    asr_engine = resolve_engine(
+        args.asr_engine or os.environ.get("TRANSCRIBE_ASR"),
+        default="whisper",
+    )
+    model_name = str(args.model or default_model_for(asr_engine))
 
     try:
         if transcript_path.is_file() and not args.force:
@@ -202,20 +248,21 @@ def main(argv: list[str] | None = None) -> int:
         language = None if args.language == "auto" else args.language
         timeline_offset = float(args.timeline_offset or 0.0)
         segments: list[dict[str, Any]] = []
+        matchup = matchup_from_name(dataset_dir.name)
+        prompt = build_prompt(
+            champion=matchup.get("champion") or "",
+            opponent=matchup.get("opponent") or "",
+            extra=str(args.asr_prompt or ""),
+        )
 
         print(
             f"[transcribe-windows] {len(anchors)} anchors → {len(clusters)} windows "
-            f"model={args.model} offset={timeline_offset}",
+            f"engine={asr_engine} model={model_name} offset={timeline_offset}",
             flush=True,
         )
 
         with tempfile.TemporaryDirectory(prefix="event-asr-") as tmp:
             tmp_dir = Path(tmp)
-            from faster_whisper import WhisperModel
-
-            model = WhisperModel(
-                args.model, device=args.device, compute_type=args.compute_type
-            )
 
             for index, (a0, a1) in enumerate(clusters, start=1):
                 abs_start = max(0.0, a0 - args.pre_roll)
@@ -229,20 +276,35 @@ def main(argv: list[str] | None = None) -> int:
                     flush=True,
                 )
                 extract_wav(source, wav, start=local_start, duration=duration)
-                segs_iter, _info = model.transcribe(
-                    str(wav),
+                words, _detected, _meta = transcribe_words(
+                    wav,
+                    engine=asr_engine,
+                    model_name=model_name,
                     language=language,
-                    vad_filter=True,
-                    word_timestamps=False,
+                    device=args.device,
+                    compute_type=args.compute_type,
+                    prompt=prompt,
+                    align=bool(args.align),
+                    align_model=str(args.align_model or DEFAULT_WHISPER_MODEL),
+                    filter_low_confidence=False,
                 )
-                for segment in segs_iter:
-                    text = segment.text.strip()
+                window_segments = words_to_segments(words)
+                if not window_segments and _meta.get("raw_text"):
+                    window_segments = [
+                        {
+                            "start": 0.0,
+                            "end": duration,
+                            "text": str(_meta["raw_text"]),
+                        }
+                    ]
+                for segment in window_segments:
+                    text = str(segment.get("text") or "").strip()
                     if not text:
                         continue
                     segments.append(
                         {
-                            "start": round(abs_start + float(segment.start), 3),
-                            "end": round(abs_start + float(segment.end), 3),
+                            "start": round(abs_start + float(segment["start"]), 3),
+                            "end": round(abs_start + float(segment["end"]), 3),
                             "text": text,
                         }
                     )
@@ -253,7 +315,8 @@ def main(argv: list[str] | None = None) -> int:
             "dataset_id": dataset_dir.name,
             "created_at": datetime.now(timezone.utc).isoformat(),
             "source_audio": str(source),
-            "model": args.model,
+            "engine": asr_engine,
+            "model": model_name,
             "language": args.language,
             "mode": "event_windows",
             "window_count": len(clusters),

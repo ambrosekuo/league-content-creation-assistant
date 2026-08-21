@@ -132,7 +132,9 @@ gcloud run jobs create vod-archive-nightly \
 >
 > **Daily compilation:** `python cloud_job.py process-daily --day-key aug12_2026 --top-k 12` restores every VOD’s `lol_clips/` for that day, ranks globally, keeps the top 12 (max 3 per game), stitches `daily_top12.mp4`, uploads to `vods/{dayKey}/_daily/`. Local: `--dataset-dir data/VOD_ID --vod-id VOD_ID` (no upload unless `--upload`).
 >
-> **Portrait post-process job** (separate): `python cloud_job.py process-portraits --vod-id <id> --cleanup` downloads `lol_compilations/gam*.mp4` (or legacy `*_weave.mp4`), restores `gs://$GCS_BUCKET/assets/` (stings, brand stills, music), renders 9:16 facecam+KDA portraits (overlay intro + rank-card outro) into `lol_compilations_portrait/`, uploads. Job: `vod-portrait-process` — see `deploy/create_portrait_job.example.sh`. Sync assets first with `python cloud_job.py upload-assets`. Riot key optional (live Challenger cutoff; falls back if missing). `--intro story` restores the old lobby card.
+> **Portrait layout job** (dry 9:16): `python cloud_job.py process-portraits --vod-id <id> --cleanup` downloads `lol_compilations/gam*.mp4`, restores assets, renders facecam+KDA+blur bars (`--intro none --no-outro --music off`) into `lol_compilations_portrait/`. Job: `vod-portrait-process`.
+>
+> **Portrait decorate job** (same Cloud Run image, different args): `python cloud_job.py process-decorate-portraits --vod-id <id> --cleanup` adds combos, captions, road-to-Challenger intro, rank-card outro → `*_portrait_decorated.mp4` (no music). Viewer: **Decorate portraits**. Mix music afterward with `mix_portrait_music.py` or the review **Music** tab.
 >
 > **Chain archive → clips** (no portraits):  
 > `gcloud workflows run archive-clip-portrait --location=us-east1 --data='{"vodId":"YOUR_VOD"}'`.  

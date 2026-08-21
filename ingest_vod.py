@@ -14,6 +14,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from dataset_paths import dated_dir_name, find_dataset_dir, vod_id_from_dir_name
+from storage_gcs import day_key_from_dt
 from yt_dlp import YoutubeDL
 
 
@@ -288,12 +290,35 @@ def main() -> int:
     else:
         dataset_id = args.id or args.local_file.stem
 
-    dataset_id = safe_id(dataset_id)
-    folder = args.output_root.resolve() / dataset_id
+    vod_id = safe_id(dataset_id)
+    output_root = args.output_root.resolve()
+    folder = find_dataset_dir(output_root, vod_id)
+    early_meta: dict[str, Any] | None = None
+
+    if folder is None:
+        if args.url:
+            early_meta = fetch_vod_metadata(args.url)
+            ts = early_meta.get("timestamp")
+            if ts is not None:
+                day_key = day_key_from_dt(
+                    datetime.fromtimestamp(int(ts), tz=timezone.utc)
+                )
+                folder = output_root / dated_dir_name(day_key, vod_id)
+            else:
+                folder = output_root / vod_id
+        elif args.local_file:
+            day_key = day_key_from_dt(
+                datetime.fromtimestamp(args.local_file.stat().st_mtime, tz=timezone.utc)
+            )
+            folder = output_root / dated_dir_name(day_key, vod_id)
+        else:
+            folder = output_root / vod_id
+
     folder.mkdir(parents=True, exist_ok=True)
+    dataset_id = vod_id_from_dir_name(folder.name)
 
     try:
-        extractor_metadata: dict[str, Any] | None = None
+        extractor_metadata: dict[str, Any] | None = early_meta
 
         format_selector = (
             args.format
@@ -303,7 +328,7 @@ def main() -> int:
 
         if args.url and args.metadata_only:
             print("[ingest] metadata-only", flush=True)
-            extractor_metadata = fetch_vod_metadata(args.url)
+            extractor_metadata = extractor_metadata or fetch_vod_metadata(args.url)
             (folder / "metadata.json").write_text(
                 json.dumps(extractor_metadata, indent=2, ensure_ascii=False),
                 encoding="utf-8",

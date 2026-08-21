@@ -268,9 +268,10 @@ def main() -> int:
     existing = sorted((ROOT / "data").glob("*/metadata.json"))
     if existing:
         vod_dir = existing[-1].parent
-        # Prefer the known sample dataset if present.
-        preferred = ROOT / "data" / "2833454760"
-        if preferred.is_dir() and (preferred / "metadata.json").is_file():
+        from dataset_paths import find_dataset_dir
+
+        preferred = find_dataset_dir(ROOT / "data", "2833454760")
+        if preferred and (preferred / "metadata.json").is_file():
             vod_dir = preferred
         steps.append(run_step("3_vod_map", lambda: step_vod_map(vod_dir)))
     else:

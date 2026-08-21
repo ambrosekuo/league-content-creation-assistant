@@ -8,7 +8,7 @@ you pass that path yourself.
 
 from __future__ import annotations
 
-import argparse
+from dataset_paths import find_dataset_dir, vod_id_from_dir_name
 import json
 import os
 import subprocess
@@ -17,7 +17,7 @@ import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
-
+import argparse
 from env_loader import load_dotenv
 
 
@@ -125,7 +125,7 @@ def cmd_index(args: argparse.Namespace) -> int:
     if args.upload:
         import storage_gcs as gcs
 
-        vod_id = (args.vod_id or dataset_dir.name).strip().lstrip("v")
+        vod_id = vod_id_from_dir_name(args.vod_id or dataset_dir.name)
         uri = gcs.upload_file(
             events_out,
             f"{gcs.vod_prefix(vod_id)}/lol_events.json",
@@ -442,6 +442,27 @@ def cmd_recut_clips(args: argparse.Namespace) -> int:
             if restored_subdir and not getattr(args, "clips_subdir", None):
                 args.clips_subdir = restored_subdir
 
+    # Incomplete fast-cut: transcript is often local-only until the run finishes.
+    # Re-running Whisper on a long VOD OOMs; snap still works with empty segments.
+    marker_path = dataset_dir / ".cut_run.json"
+    if marker_path.is_file() and _transcript_snap_enabled():
+        try:
+            incomplete = not json.loads(marker_path.read_text(encoding="utf-8")).get(
+                "complete"
+            )
+        except (OSError, json.JSONDecodeError):
+            incomplete = False
+        transcript_path = dataset_dir / "transcript.json"
+        if incomplete and not transcript_path.is_file():
+            transcript_path.write_text(
+                json.dumps({"schema_version": 1, "segments": []}, indent=2) + "\n",
+                encoding="utf-8",
+            )
+            print(
+                "[transcribe-windows] skip (resume incomplete cut; no transcript in GCS)",
+                flush=True,
+            )
+
     events_path = dataset_dir / "lol_events.json"
     # Always re-index on recut so overlap/bookend fixes land in GCS
     # (stale lol_events.json would permanently drop games that started before the VOD).
@@ -745,6 +766,8 @@ def cmd_process_portraits(args: argparse.Namespace) -> int:
         print(f"[assets] restore {gcs.assets_uri()} → {ROOT / 'assets'}", flush=True)
         gcs.restore_render_assets(ROOT / "assets")
 
+    only = str(getattr(args, "only", "") or "").strip().lower()
+
     if args.dataset_dir:
         comp_dir = dataset_dir / "lol_compilations"
         if not comp_dir.is_dir():
@@ -754,7 +777,11 @@ def cmd_process_portraits(args: argparse.Namespace) -> int:
         if dataset_dir.exists() and args.clean_work:
             shutil.rmtree(dataset_dir, ignore_errors=True)
         print(f"[restore] lol_compilations/ for {vod_id}", flush=True)
-        gcs.restore_compilations_prefix(vod_id, dataset_dir)
+        gcs.restore_compilations_prefix(
+            vod_id,
+            dataset_dir,
+            name_contains=only or None,
+        )
         origin = "gcs_compilations"
 
     comp_dir = dataset_dir / "lol_compilations"
@@ -773,6 +800,9 @@ def cmd_process_portraits(args: argparse.Namespace) -> int:
         },
         key=lambda p: p.name,
     )
+    if only:
+        weaves = [p for p in weaves if only in p.name.lower()]
+        print(f"[portrait] --only {only!r} → {len(weaves)} weave(s)", flush=True)
     if getattr(args, "max_weaves", 0):
         weaves = weaves[: max(0, int(args.max_weaves))]
         print(f"[portrait] limited to first {len(weaves)} weave(s)", flush=True)
@@ -782,8 +812,8 @@ def cmd_process_portraits(args: argparse.Namespace) -> int:
             "(lobby intros are ignored)"
         )
 
-    # Clear remote once up front when forcing a full re-render (not dataset-dir runs).
-    if args.force and not args.dataset_dir:
+    # Clear remote once up front when forcing a full re-render (not dataset-dir / --only).
+    if args.force and not args.dataset_dir and not only:
         day = gcs.resolve_day_key(vod_id, dataset_dir)
         remote_prefix = f"{gcs.vod_prefix(vod_id, day_key=day)}/lol_compilations_portrait/"
         removed = gcs.delete_prefix(remote_prefix)
@@ -958,6 +988,102 @@ def cmd_process_portraits(args: argparse.Namespace) -> int:
         "preset": str(args.preset),
         "crf": int(args.crf),
         "track_champion": bool(args.track_champion),
+    }
+    if args.cleanup and not args.dataset_dir:
+        shutil.rmtree(dataset_dir, ignore_errors=True)
+    print(json.dumps(result, indent=2))
+    return 0
+
+
+def cmd_process_decorate_portraits(args: argparse.Namespace) -> int:
+    """Combos + captions + intro/outro on dry GCS portraits (no music)."""
+    import shutil
+
+    import storage_gcs as gcs
+
+    vod_id = str(args.vod_id).strip().lstrip("v")
+    work_dir = Path(os.environ.get("WORK_DIR") or args.work_dir or "/tmp/vod-work")
+    work_dir.mkdir(parents=True, exist_ok=True)
+    dataset_dir = Path(args.dataset_dir).resolve() if args.dataset_dir else work_dir / vod_id
+    only = str(getattr(args, "only", "") or "").strip()
+
+    if not args.skip_assets and gcs.is_configured():
+        print(f"[assets] restore {gcs.assets_uri()} → {ROOT / 'assets'}", flush=True)
+        gcs.restore_render_assets(ROOT / "assets")
+
+    if args.dataset_dir:
+        origin = "dataset_dir"
+        if not any(
+            (dataset_dir / name).is_dir()
+            for name in ("lol_compilations_portrait", "lol_compilations_picks_portrait")
+        ):
+            raise FileNotFoundError(f"Missing portrait dir in {dataset_dir}")
+    else:
+        if dataset_dir.exists() and args.clean_work:
+            shutil.rmtree(dataset_dir, ignore_errors=True)
+        print(f"[restore] portraits + compilations for {vod_id}", flush=True)
+        gcs.restore_portraits_prefix(vod_id, dataset_dir, name_contains=only or None)
+        gcs.restore_compilations_prefix(vod_id, dataset_dir, name_contains=only or None)
+        origin = "gcs"
+
+    cmd = [
+        sys.executable,
+        str(ROOT / "decorate_portrait.py"),
+        "--dataset-dir",
+        str(dataset_dir),
+        "--music",
+        str(args.music),
+        "--music-db",
+        str(args.music_db),
+        "--overlay-hold",
+        str(args.overlay_hold),
+        "--end-seconds",
+        str(args.end_seconds),
+        "--preset",
+        str(args.preset),
+        "--crf",
+        str(args.crf),
+    ]
+    if only:
+        cmd += ["--only", only]
+    if args.force:
+        cmd.append("--force")
+    if getattr(args, "force_combos", False):
+        cmd.append("--force-combos")
+    if getattr(args, "skip_combos", False):
+        cmd.append("--skip-combos")
+    if getattr(args, "skip_captions", False):
+        cmd.append("--skip-captions")
+    if getattr(args, "skip_wrap", False):
+        cmd.append("--skip-wrap")
+    print(f"[decorate] {dataset_dir}", flush=True)
+    _run(cmd)
+
+    uploaded: dict[str, str] = {}
+    if not args.dataset_dir:
+        paths: list[Path] = []
+        for folder in (
+            dataset_dir / "lol_compilations_portrait",
+            dataset_dir / "lol_compilations_picks_portrait",
+            dataset_dir / "lol_compilations",
+            dataset_dir / "lol_compilations_picks",
+        ):
+            if not folder.is_dir():
+                continue
+            paths.extend(sorted(folder.glob("*_decorated.mp4")))
+            paths.extend(sorted(folder.glob("*_captions.json")))
+            paths.extend(sorted(folder.glob("*_combo.json")))
+        if paths:
+            uploaded.update(gcs.upload_portrait_paths(dataset_dir, paths, vod_id=vod_id))
+
+    prefix = gcs.vod_prefix(vod_id, dataset_dir=dataset_dir)
+    result = {
+        "status": "process_decorate_portraits",
+        "vodId": vod_id,
+        "origin": origin,
+        "uploaded": len(uploaded),
+        "portraitsPrefix": f"gs://{gcs.bucket_name()}/{prefix}/lol_compilations_portrait/",
+        "objects": uploaded,
     }
     if args.cleanup and not args.dataset_dir:
         shutil.rmtree(dataset_dir, ignore_errors=True)
@@ -2132,7 +2258,8 @@ def build_parser() -> argparse.ArgumentParser:
         "process-portraits",
         help=(
             "Post-process GCS lol_compilations/gam*.mp4 (or legacy *_weave.mp4) "
-            "into lol_compilations_portrait/*_portrait.mp4 (9:16 TikTok/Shorts)"
+            "into lol_compilations_portrait/*_portrait.mp4 (dry 9:16 layout; "
+            "intro/outro/captions/music are process-decorate-portraits)"
         ),
     )
     p_port.add_argument("--vod-id", required=True)
@@ -2150,16 +2277,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Only render the first N weaves (0 = all). Useful for a single-game test.",
     )
     p_port.add_argument(
+        "--only",
+        default="",
+        help="Only render weaves whose filename contains this substring (e.g. leblanc_vs_ryze)",
+    )
+    p_port.add_argument(
         "--intro",
         choices=("overlay", "story", "none"),
-        default="overlay",
-        help="Opening: overlay on gameplay (default), story=deprecated lobby card, none",
+        default="none",
+        help="Opening: none=dry layout (default). Use process-decorate-portraits for overlay",
     )
     p_port.add_argument(
         "--outro",
         action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Append the rank-card end outro (default: on)",
+        default=False,
+        help="Append the rank-card end outro (default: off; use process-decorate-portraits)",
     )
     p_port.add_argument(
         "--overlay-hold",
@@ -2225,10 +2357,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_port.add_argument("--track-outside-hold", type=float, default=1.5)
     p_port.add_argument(
         "--music",
-        default="auto",
-        help="Lofi bed: auto=random catalog pick (default), off, or catalog id",
+        default="off",
+        help="Music bed: off (default; caption first, then mix), auto=pool pick, "
+        "pool[:category], track id, lofi[:id]",
     )
-    p_port.add_argument("--music-db", type=float, default=-20.0)
+    p_port.add_argument("--music-db", type=float, default=-18.0)
     p_port.add_argument("--preset", default="veryfast", help="x264 preset (default: veryfast)")
     p_port.add_argument("--crf", type=int, default=20)
     p_port.add_argument(
@@ -2252,6 +2385,33 @@ def build_parser() -> argparse.ArgumentParser:
         help="Delete local WORK_DIR copy after upload",
     )
     p_port.set_defaults(func=cmd_process_portraits)
+
+    p_dec = sub.add_parser(
+        "process-decorate-portraits",
+        help=(
+            "Decorate dry lol_compilations_portrait/*_portrait.mp4: "
+            "combos, captions, intro/outro (no music)"
+        ),
+    )
+    p_dec.add_argument("--vod-id", required=True)
+    p_dec.add_argument("--dataset-dir", type=Path, default=None)
+    p_dec.add_argument("--work-dir", type=Path, default=None)
+    p_dec.add_argument("--only", default="")
+    p_dec.add_argument("--music", default="off")
+    p_dec.add_argument("--music-db", type=float, default=-18.0)
+    p_dec.add_argument("--overlay-hold", type=float, default=2.0)
+    p_dec.add_argument("--end-seconds", type=float, default=2.5)
+    p_dec.add_argument("--preset", default="veryfast")
+    p_dec.add_argument("--crf", type=int, default=20)
+    p_dec.add_argument("--skip-combos", action="store_true")
+    p_dec.add_argument("--skip-captions", action="store_true")
+    p_dec.add_argument("--skip-wrap", action="store_true")
+    p_dec.add_argument("--force-combos", action="store_true")
+    p_dec.add_argument("--skip-assets", action="store_true")
+    p_dec.add_argument("--force", action="store_true")
+    p_dec.add_argument("--clean-work", action="store_true")
+    p_dec.add_argument("--cleanup", action="store_true")
+    p_dec.set_defaults(func=cmd_process_decorate_portraits)
 
     p_seg = sub.add_parser(
         "process-segmented",

@@ -1,0 +1,84 @@
+{
+  "version": 1,
+  "notes": "Curated montage pool — 6 vetted tracks. Drop more in inbox/ and adopt with music_pool.py.",
+  "sources": {
+    "uppbeat": "https://uppbeat.io/",
+    "streambeats": "https://streambeats.com/",
+    "pretzel": "https://pretzel.rocks/",
+    "mixkit": "https://mixkit.co/free-stock-music/"
+  },
+  "tracks": [
+    {
+      "id": "a-game",
+      "file": "inbox/a-game_777.mp3",
+      "name": "A Game",
+      "source": "mixkit",
+      "license": "mixkit-free",
+      "mood": ["confident", "energetic"],
+      "energy": 0.84,
+      "categories": ["outplay", "multikill", "chase"],
+      "bpm": 128,
+      "enabled": true
+    },
+    {
+      "id": "cant-get-you-off-my-mind-nc",
+      "file": "inbox/cant-get-you-off-my-mind_1210_nc.mp3",
+      "name": "Can't Get You Off My Mind (NC)",
+      "source": "mixkit",
+      "license": "mixkit-free",
+      "mood": ["bright", "energetic"],
+      "energy": 0.88,
+      "categories": ["multikill", "chase", "outplay"],
+      "bpm": 155,
+      "enabled": true
+    },
+    {
+      "id": "dance-zero-nc",
+      "file": "inbox/dance-zero_740_nc.mp3",
+      "name": "Dance Zero (NC)",
+      "source": "mixkit",
+      "license": "mixkit-free",
+      "mood": ["bounce", "playful"],
+      "energy": 0.78,
+      "categories": ["mistake", "multikill", "reaction"],
+      "bpm": 140,
+      "enabled": true
+    },
+    {
+      "id": "goa-trance-mantra-nc",
+      "file": "inbox/goa-trance-mantra_137_nc.mp3",
+      "name": "Goa Trance Mantra (NC)",
+      "source": "mixkit",
+      "license": "mixkit-free",
+      "mood": ["hypnotic", "energetic"],
+      "energy": 0.84,
+      "categories": ["chase", "multikill", "survival"],
+      "bpm": 152,
+      "enabled": true
+    },
+    {
+      "id": "one-more-dance-nc",
+      "file": "inbox/one-more-dance_288_nc.mp3",
+      "name": "One More Dance (NC)",
+      "source": "mixkit",
+      "license": "mixkit-free",
+      "mood": ["fun", "bounce"],
+      "energy": 0.76,
+      "categories": ["mistake", "reaction"],
+      "bpm": 130,
+      "enabled": true
+    },
+    {
+      "id": "what-about-action-nc",
+      "file": "inbox/what-about-action_474_nc.mp3",
+      "name": "What About Action? (NC)",
+      "source": "mixkit",
+      "license": "mixkit-free",
+      "mood": ["bounce", "playful"],
+      "energy": 0.74,
+      "categories": ["mistake", "outplay"],
+      "bpm": 132,
+      "enabled": true
+    }
+  ]
+}

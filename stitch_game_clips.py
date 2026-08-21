@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 from clip_edge_pad import PAD_LEAD_S, PAD_TRAIL_S, detect_edge_freezes
+from dataset_paths import game_only_matches
 
 ROOT = Path(__file__).resolve().parent
 
@@ -34,6 +35,50 @@ def run(cmd: list[str]) -> None:
     if proc.returncode != 0:
         detail = (proc.stderr or proc.stdout or "").strip()
         raise RuntimeError(f"Command failed ({proc.returncode}): {' '.join(cmd)}\n{detail}")
+
+
+def _parse_fps_rate(rate: str) -> float | None:
+    if not rate or rate in {"0/0", "N/A"}:
+        return None
+    if "/" not in rate:
+        try:
+            fps = float(rate)
+        except ValueError:
+            return None
+    else:
+        num, den = rate.split("/", 1)
+        try:
+            fps = float(num) / max(float(den), 1.0)
+        except ValueError:
+            return None
+    if fps <= 1.0:
+        return None
+    return fps
+
+
+def _fps_from_stream(stream: dict[str, Any], *, duration: float | None = None) -> float:
+    """Pick output fps without upsampling sparse copy-concat weaves."""
+    avg = _parse_fps_rate(str(stream.get("avg_frame_rate") or ""))
+    nominal = _parse_fps_rate(str(stream.get("r_frame_rate") or ""))
+
+    effective: float | None = None
+    nb = stream.get("nb_frames")
+    dur = duration if duration is not None else stream.get("duration")
+    if nb is not None and dur:
+        try:
+            effective = int(nb) / max(float(dur), 0.001)
+        except (TypeError, ValueError):
+            effective = None
+
+    if effective and effective > 1.0:
+        if nominal and nominal >= 29.5 and effective < nominal * 0.5:
+            return max(1.0, min(effective, 60.0))
+
+    if avg:
+        return max(1.0, min(avg, 60.0))
+    if nominal:
+        return max(1.0, min(nominal, 60.0))
+    return 30.0
 
 
 def discover_games(clips_dir: Path) -> list[tuple[str, list[Path]]]:
@@ -53,24 +98,36 @@ def apply_top_k(
     clips_dir: Path,
     top_k: int,
     extra_dirs: list[Path] | None = None,
+    selector: str = "current",
+    min_score: float = 3.5,
+    max_duration: float = 150.0,
+    write_outputs: bool = True,
 ) -> tuple[list[tuple[str, list[Path]]], dict[str, Any]]:
-    """Rank clips and keep the best top_k per game, still in chrono order."""
-    from score_clips import pick_top_k, rank_dataset, write_rank_outputs
+    """Rank clips and keep a recap slate per game, still in chrono order."""
+    from score_clips import pick_by_selector, rank_dataset, write_rank_outputs
 
     scored = rank_dataset(dataset_dir, clips_dir)
     if not scored:
-        return games, {"top_k": top_k, "picked": 0, "scored": 0}
-    picks = pick_top_k(scored, top_k, per_game=True)
-    write_rank_outputs(
-        dataset_dir=dataset_dir,
-        clips_dir=clips_dir,
-        scored=scored,
-        picks=picks,
-        top_k=top_k,
-        extra_dirs=extra_dirs,
+        return games, {"top_k": top_k, "picked": 0, "scored": 0, "selector": selector}
+    picks = pick_by_selector(
+        scored,
+        selector,
         per_game=True,
-        scope="game",
+        top_k=top_k if str(selector).strip().lower() in {"current", "competitive"} else None,
+        min_score=min_score,
+        max_duration=max_duration,
     )
+    if write_outputs:
+        write_rank_outputs(
+            dataset_dir=dataset_dir,
+            clips_dir=clips_dir,
+            scored=scored,
+            picks=picks,
+            top_k=top_k,
+            extra_dirs=extra_dirs,
+            per_game=True,
+            scope="game",
+        )
     keep_by_folder: dict[str, set[str]] = {}
     for clip in picks:
         folder = str(clip.get("gameFolder") or Path(clip["relativePath"]).parent.name)
@@ -84,13 +141,14 @@ def apply_top_k(
             continue
         kept = [p for p in clips if p.name in names]
         print(
-            f"[rank] {folder}: {len(clips)} → {len(kept)} (top {top_k})",
+            f"[rank] {folder}: {len(clips)} → {len(kept)} ({selector})",
             flush=True,
         )
         if kept:
             filtered.append((folder, kept))
     return filtered, {
         "top_k": top_k,
+        "selector": selector,
         "scored": len(scored),
         "picked": len(picks),
         "files": [c.get("relativePath") for c in picks],
@@ -176,6 +234,115 @@ def games_from_manifest(clips_dir: Path, manifest: dict[str, Any]) -> list[tuple
         if ordered:
             games.append((folder, ordered))
     return games or discover_games(clips_dir)
+
+
+def approved_clip_path(dataset_dir: Path, rel: str) -> Path:
+    rel = str(rel or "").lstrip("/")
+    if rel.startswith("lol_clips/"):
+        return dataset_dir / rel
+    return dataset_dir / "lol_clips" / rel
+
+
+def clip_has_game_end(path: Path) -> bool:
+    return "game_end" in path.name.lower()
+
+
+def _clip_index(path: Path) -> int:
+    name = path.name
+    if not name.startswith("c") or "_" not in name:
+        return 0
+    try:
+        return int(name[1 : name.index("_")])
+    except ValueError:
+        return 0
+
+
+def find_game_end_clip(game_folder: Path) -> Path | None:
+    """Last nexus / GAME_END clip in a game folder (c15_game_end, c09_kill+game_end_…)."""
+    if not game_folder.is_dir():
+        return None
+    candidates = [p for p in game_folder.glob("c*.mp4") if clip_has_game_end(p)]
+    if not candidates:
+        return None
+    return max(candidates, key=_clip_index)
+
+
+def append_game_end_if_missing(folder: str, clips: list[Path], dataset_dir: Path) -> list[Path]:
+    if any(clip_has_game_end(p) for p in clips):
+        return clips
+    game_folder = (clips[0].parent if clips else dataset_dir / "lol_clips" / folder)
+    end_clip = find_game_end_clip(game_folder)
+    if end_clip is None or not end_clip.is_file():
+        print(f"[approved] no nexus clip in {folder}", flush=True)
+        return clips
+    print(f"[approved] append nexus {end_clip.name} → {folder}", flush=True)
+    return [*clips, end_clip]
+
+
+def games_from_approved(
+    dataset_dir: Path,
+    rows: list[dict[str, Any]],
+) -> tuple[list[tuple[str, list[Path]]], list[str]]:
+    """Group reviewed clip rows into stitch game folders (chrono by vod time)."""
+    by_game: dict[str, list[tuple[float, str, Path]]] = {}
+    missing: list[str] = []
+    seen: set[str] = set()
+    for row in rows:
+        rel = str(row.get("relativePath") or "").lstrip("/")
+        if not rel:
+            continue
+        path = approved_clip_path(dataset_dir, rel)
+        key = str(path.resolve()) if path.exists() else str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        if not path.is_file():
+            missing.append(rel)
+            continue
+        folder = path.parent.name
+        order = row.get("vodTimeSeconds")
+        try:
+            stamp = float(order) if order is not None else 0.0
+        except (TypeError, ValueError):
+            stamp = 0.0
+        by_game.setdefault(folder, []).append((stamp, str(row.get("id") or path.name), path))
+    games: list[tuple[str, list[Path]]] = []
+    for folder in sorted(by_game):
+        ordered = [p for _, _, p in sorted(by_game[folder], key=lambda t: (t[0], t[1]))]
+        ordered = append_game_end_if_missing(folder, ordered, dataset_dir)
+        if ordered:
+            games.append((folder, ordered))
+    return games, missing
+
+
+def load_approved_rows(
+    dataset_dir: Path,
+    ratings: list[str],
+    approved_file: Path | None = None,
+) -> list[dict[str, Any]]:
+    if approved_file is not None:
+        payload = load_json(approved_file)
+        if isinstance(payload, list):
+            return payload
+        raise ValueError(f"{approved_file} is not a clip list")
+    from dataset_paths import day_key_from_dir_name, vod_id_from_dir_name
+    from viewer.store import QUEUE_FILES, clip_review_dir
+
+    vid = vod_id_from_dir_name(dataset_dir.name)
+    day = day_key_from_dir_name(dataset_dir.name)
+    rows: list[dict[str, Any]] = []
+    for rating in ratings:
+        filename = QUEUE_FILES.get(rating)
+        if not filename:
+            raise ValueError(f"unknown rating {rating}")
+        path = clip_review_dir(vid, day) / "approved" / filename
+        if not path.is_file():
+            print(f"[approved] missing {path}", flush=True)
+            continue
+        payload = load_json(path)
+        if isinstance(payload, list):
+            rows.extend(payload)
+    return rows
 
 
 def match_id_for_folder(
@@ -284,7 +451,7 @@ def probe_video(path: Path) -> dict[str, Any]:
             "-select_streams",
             "v:0",
             "-show_entries",
-            "stream=width,height,r_frame_rate",
+            "stream=width,height,r_frame_rate,avg_frame_rate,nb_frames",
             "-show_entries",
             "format=duration",
             "-of",
@@ -299,14 +466,6 @@ def probe_video(path: Path) -> dict[str, Any]:
     data = json.loads(proc.stdout or "{}")
     streams = data.get("streams") or [{}]
     s0 = streams[0] if streams else {}
-    fps = 30.0
-    rate = str(s0.get("r_frame_rate") or "30/1")
-    if "/" in rate:
-        num, den = rate.split("/", 1)
-        try:
-            fps = float(num) / max(float(den), 1.0)
-        except ValueError:
-            fps = 30.0
     try:
         duration = float((data.get("format") or {}).get("duration") or 0.0)
     except (TypeError, ValueError):
@@ -314,7 +473,7 @@ def probe_video(path: Path) -> dict[str, Any]:
     return {
         "width": int(s0.get("width") or 1920),
         "height": int(s0.get("height") or 1080),
-        "fps": max(1.0, min(fps, 60.0)),
+        "fps": _fps_from_stream(s0, duration=duration),
         "duration": max(0.0, duration),
     }
 
@@ -558,7 +717,8 @@ def stitch_one(
                 f"pad={w}:{h}:(ow-iw)/2:(oh-ih)/2:color=0x0A0C12,"
                 f"fps={rate:.3f},setsar=1[v{i}];"
                 f"[{i}:a]{a_head}"
-                f"aformat=sample_rates=48000:channel_layouts=stereo[a{i}];"
+                f"aformat=sample_rates=48000:channel_layouts=stereo,"
+                f"aresample=async=1:first_pts=0[a{i}];"
             )
         concat_in = "".join(f"[v{i}][a{i}]" for i in range(len(src_clips)))
         filter_complex = (
@@ -605,6 +765,15 @@ def stitch_one(
             )
         finally:
             list_path.unlink(missing_ok=True)
+
+    total_dur = sum(float(probe_video(c).get("duration") or 0.0) for c in clips)
+    if not reencode and len(clips) >= 8 and total_dur > 240.0:
+        print(
+            f"[stitch] {len(clips)} clips / {total_dur:.0f}s → reencode "
+            "(copy-concat drops frames on long weaves)",
+            flush=True,
+        )
+        reencode = True
 
     if reencode:
         filter_concat(clips)
@@ -677,6 +846,31 @@ def build_parser() -> argparse.ArgumentParser:
         help="Rank clips and stitch only the best N per game (default: 5). 0 = all clips.",
     )
     p.add_argument(
+        "--selector",
+        default="current",
+        help=(
+            "Recap picker: current (top-5 + reserved closer), competitive "
+            "(top-5, closer competes), top8, duration (score floor + 150s budget)."
+        ),
+    )
+    p.add_argument(
+        "--only",
+        default="",
+        help="Only stitch game folders whose name contains this substring.",
+    )
+    p.add_argument(
+        "--min-score",
+        type=float,
+        default=3.5,
+        help="With --selector duration, drop clips below this score (default: 3.5).",
+    )
+    p.add_argument(
+        "--max-duration",
+        type=float,
+        default=150.0,
+        help="With --selector duration, max recap seconds per game (default: 150).",
+    )
+    p.add_argument(
         "--no-rank",
         action="store_true",
         help="Skip ranking; stitch every clip in each game folder.",
@@ -697,6 +891,18 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("chrono", "score"),
         default="chrono",
         help="With --daily, clip order (default: chrono).",
+    )
+    p.add_argument(
+        "--from-approved",
+        default="",
+        help="Stitch only reviewed clips (comma list: godly, excellent, keep, manual_edit). "
+        "Reads data/_viewer/{day}_{vod}/approved/*.json. Implies --no-rank.",
+    )
+    p.add_argument(
+        "--approved-file",
+        type=Path,
+        default=None,
+        help="Optional clip-list JSON instead of data/_viewer/.../approved/*.json",
     )
     p.add_argument("--force", action="store_true", help="Overwrite existing weaves")
     p.add_argument(
@@ -744,7 +950,20 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     dataset_dir = args.dataset_dir.resolve()
     clips_dir = (args.clips_dir or dataset_dir / "lol_clips").resolve()
-    out_dir = (args.output_dir or dataset_dir / "lol_compilations").resolve()
+    approved_ratings = [
+        part.strip().lower()
+        for part in str(args.from_approved or "").split(",")
+        if part.strip()
+    ]
+    if approved_ratings:
+        unknown = [r for r in approved_ratings if r not in {"godly", "excellent", "keep", "manual_edit"}]
+        if unknown:
+            print(f"error: --from-approved ratings must be godly/excellent/keep/manual_edit, got {unknown}", file=sys.stderr)
+            return 2
+        default_out = dataset_dir / f"lol_compilations_{'_'.join(approved_ratings)}"
+    else:
+        default_out = dataset_dir / "lol_compilations"
+    out_dir = (args.output_dir or default_out).resolve()
     want_lobby = (not args.no_lobby) and float(args.lobby_seconds) > 0
 
     if not clips_dir.is_dir():
@@ -806,13 +1025,42 @@ def main(argv: list[str] | None = None) -> int:
 
     manifest_path = clips_dir / "clips.json"
     manifest = load_json(manifest_path) if manifest_path.is_file() else None
-    if manifest is not None:
+    if approved_ratings:
+        try:
+            rows = load_approved_rows(dataset_dir, approved_ratings, args.approved_file)
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 1
+        games, missing = games_from_approved(dataset_dir, rows)
+        if missing:
+            print(f"[approved] {len(missing)} rated clip(s) not on disk (sync them first)", flush=True)
+            for rel in missing[:12]:
+                print(f"  missing {rel}", flush=True)
+        print(
+            f"[approved] {','.join(approved_ratings)} → {sum(len(c) for _, c in games)} clip(s) in {len(games)} game(s)",
+            flush=True,
+        )
+        if not games:
+            print("error: no local approved clips to stitch", file=sys.stderr)
+            return 1
+        rank_meta = {"top_k": 0, "enabled": False, "from_approved": approved_ratings}
+        top_k = 0
+        if int(args.min_clips) == 2:
+            args.min_clips = 1
+    elif manifest is not None:
         games = games_from_manifest(clips_dir, manifest)
     else:
         games = discover_games(clips_dir)
 
-    rank_meta: dict[str, Any] = {"top_k": 0, "enabled": False}
-    top_k = 0 if args.no_rank else int(args.top_k)
+    only = str(args.only or "").strip().lower()
+    if only:
+        games = [(folder, clips) for folder, clips in games if game_only_matches(folder, only)]
+        print(f"[stitch] --only {only!r} → {len(games)} game(s)", flush=True)
+
+    if not approved_ratings:
+        rank_meta = {"top_k": 0, "enabled": False}
+    top_k = 0 if args.no_rank or approved_ratings else int(args.top_k)
+    selector = str(getattr(args, "selector", "current") or "current")
     if top_k > 0:
         games, rank_meta = apply_top_k(
             games,
@@ -820,6 +1068,10 @@ def main(argv: list[str] | None = None) -> int:
             clips_dir=clips_dir,
             top_k=top_k,
             extra_dirs=[out_dir],
+            selector=selector,
+            min_score=float(getattr(args, "min_score", 3.5)),
+            max_duration=float(getattr(args, "max_duration", 150.0)),
+            write_outputs=selector in {"current", "reserved", "reserved_closer"},
         )
         rank_meta["enabled"] = True
 

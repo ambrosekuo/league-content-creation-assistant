@@ -9,6 +9,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from dataset_paths import (
+    day_key_from_dir_name,
+    find_dataset_dir,
+    iter_local_vod_dirs,
+    vod_id_from_dir_name,
+)
+
 ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "data"
 
@@ -99,9 +106,9 @@ def _kind_for(rel: str) -> str:
     joined = "/".join(parts)
     if "_daily" in parts or "lol_compilations_daily" in parts:
         return "daily"
-    if "lol_compilations_portrait" in parts:
+    if "lol_compilations_picks_portrait" in parts or "lol_compilations_portrait" in parts:
         return "portrait"
-    if "lol_compilations_topk" in parts:
+    if "lol_compilations_picks" in parts or "lol_compilations_topk" in parts:
         return "weave"
     if "lol_compilations" in parts:
         return "weave"
@@ -142,26 +149,12 @@ def _day_from_meta(meta: dict[str, Any]) -> str | None:
         return None
 
 
-def _local_vod_dirs() -> list[Path]:
-    if not DATA.is_dir():
-        return []
-    out = []
-    for path in sorted(DATA.iterdir()):
-        if not path.is_dir():
-            continue
-        if path.name.startswith(SKIP_DIR_PREFIXES):
-            continue
-        if path.name.isdigit() or path.name.startswith("v"):
-            out.append(path)
-    return out
-
-
 def _rel_of(path: Path, root: Path) -> str:
     return path.relative_to(root).as_posix()
 
 
 def scan_local_vod(dataset_dir: Path) -> dict[str, Any]:
-    vid = dataset_dir.name.lstrip("v")
+    vid = vod_id_from_dir_name(dataset_dir.name)
     meta: dict[str, Any] = {}
     for name in ("metadata.json", "source.info.json"):
         path = dataset_dir / name
@@ -212,7 +205,8 @@ def scan_local_vod(dataset_dir: Path) -> dict[str, Any]:
     }
     return {
         "vodId": vid,
-        "dayKey": _day_from_meta(meta) or "local",
+        "localName": dataset_dir.name,
+        "dayKey": day_key_from_dir_name(dataset_dir.name) or _day_from_meta(meta) or "local",
         "title": meta.get("title"),
         "timestamp": meta.get("timestamp"),
         "duration": meta.get("duration"),
@@ -343,6 +337,7 @@ def _merge_vod(local: dict[str, Any] | None, remote: dict[str, Any] | None) -> d
         "duration": local.get("duration") or remote.get("duration"),
         "uploader": local.get("uploader") or remote.get("uploader"),
         "url": local.get("url") or remote.get("url"),
+        "localName": local.get("localName"),
         "localDir": local.get("localDir"),
         "gcsPrefix": remote.get("gcsPrefix"),
         "local": True,
@@ -358,6 +353,7 @@ def _summarize(vod: dict[str, Any]) -> dict[str, Any]:
     videos = vod.get("videos") or []
     return {
         "vodId": vod["vodId"],
+        "localName": vod.get("localName"),
         "dayKey": vod.get("dayKey") or "local",
         "title": vod.get("title"),
         "timestamp": vod.get("timestamp"),
@@ -374,7 +370,7 @@ def _summarize(vod: dict[str, Any]) -> dict[str, Any]:
 
 def build_catalog(*, include_gcs: bool = True) -> dict[str, Any]:
     local_map: dict[str, dict[str, Any]] = {}
-    for folder in _local_vod_dirs():
+    for folder in iter_local_vod_dirs(DATA):
         rec = scan_local_vod(folder)
         local_map[rec["vodId"]] = rec
 
@@ -448,8 +444,8 @@ def build_catalog(*, include_gcs: bool = True) -> dict[str, Any]:
 
 def get_vod(vod_id: str, *, day_key: str | None = None) -> dict[str, Any]:
     vid = vod_id.strip().lstrip("v")
-    local_dir = DATA / vid
-    local = scan_local_vod(local_dir) if local_dir.is_dir() else None
+    local_dir = find_dataset_dir(DATA, vid)
+    local = scan_local_vod(local_dir) if local_dir and local_dir.is_dir() else None
     remote = None
     day = resolve_gcs_day(vid, day_key)
     if day:
@@ -464,7 +460,10 @@ def get_vod(vod_id: str, *, day_key: str | None = None) -> dict[str, Any]:
 
 def resolve_local(vod_id: str, rel: str) -> Path:
     vid = vod_id.strip().lstrip("v")
-    base = (DATA / vid).resolve()
+    dataset_dir = find_dataset_dir(DATA, vid)
+    if dataset_dir is None:
+        raise FileNotFoundError(vid)
+    base = dataset_dir.resolve()
     path = (base / rel).resolve()
     if base not in path.parents and path != base:
         raise ValueError("path escapes dataset dir")

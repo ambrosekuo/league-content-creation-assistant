@@ -34,10 +34,16 @@ def load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+from dataset_paths import find_dataset_dir
+
+
 def resolve_dataset_dir(args: argparse.Namespace) -> Path:
     if args.dataset_dir is not None:
         return args.dataset_dir.resolve()
     if args.dataset_id is not None:
+        found = find_dataset_dir(args.output_root, args.dataset_id)
+        if found:
+            return found.resolve()
         return (args.output_root / args.dataset_id).resolve()
     raise ValueError("Provide --dataset-id or --dataset-dir.")
 

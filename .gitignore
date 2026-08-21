@@ -15,10 +15,14 @@ assets/gifs/suggested/*
 !assets/gifs/suggested/.gitkeep
 assets/music/suggested/*
 !assets/music/suggested/.gitkeep
+assets/music/inbox/*
+!assets/music/inbox/.gitkeep
 .venv/
 __pycache__/
 *.pyc
 .env
+.secrets/
+secrets/
 cookies.txt
 logs/
 lp_data.txt

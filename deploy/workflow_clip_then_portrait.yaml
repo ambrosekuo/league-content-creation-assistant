@@ -14,7 +14,7 @@ main:
           - portrait_job: ${"projects/" + project_id + "/locations/" + location + "/jobs/vod-portrait-process"}
 
     - log_start:
-        call: sys.log 
+        call: sys.log
         args:
           text: ${"clip-then-portrait start vodId=" + vod_id}
           severity: INFO
@@ -57,6 +57,15 @@ main:
                     - --crf
                     - "20"
                     - --track-champion
+                    - --game-zoom
+                    - "0.65"
+                    - --cam-hole
+                    - fill
+                    - --intro
+                    - none
+                    - --no-outro
+                    - --music
+                    - "off"
           connector_params:
             timeout: 14400
         result: portrait_op

@@ -41,6 +41,12 @@ function fmtDur(sec) {
   return h ? `${h}h ${m}m` : `${m}m`;
 }
 
+function vodLabel(vod) {
+  if (vod.localName) return vod.localName;
+  if (vod.dayKey && vod.dayKey !== "local") return `${vod.dayKey}_${vod.vodId}`;
+  return vod.vodId;
+}
+
 async function api(path, opts) {
   const res = await fetch(path, {
     headers: { "Content-Type": "application/json" },
@@ -97,7 +103,7 @@ function renderNav() {
       if (vod.flags?.portraits) flags.push("9:16");
       if (vod.flags?.weaves) flags.push("weave");
       if (vod.flags?.clips) flags.push("clips");
-      btn.innerHTML = `<strong>${vod.vodId}</strong>
+      btn.innerHTML = `<strong>${vodLabel(vod)}</strong>
         <small>${vod.title ? vod.title.slice(0, 42) : (vod.local ? "local" : "gcs")}</small>
         <span class="flags">${flags.map((f) => `<span class="flag">${f}</span>`).join("")}</span>`;
       btn.addEventListener("click", () => selectVod(vod.vodId, vod.dayKey));
@@ -174,7 +180,7 @@ function play(video) {
 
 function renderNow() {
   const vod = state.vod;
-  $("now-title").textContent = vod.title || `VOD ${vod.vodId}`;
+  $("now-title").textContent = vod.title || vodLabel(vod);
   const bits = [
     vod.dayKey,
     vod.duration ? fmtDur(vod.duration) : null,
@@ -190,6 +196,7 @@ function renderJobs() {
   const root = $("job-list");
   root.innerHTML = "";
   for (const job of state.vod?.jobs || []) {
+    if (job.surface === "review") continue;
     const btn = document.createElement("button");
     btn.type = "button";
     btn.innerHTML = `${job.label}<small>${job.help}</small>`;
@@ -214,6 +221,14 @@ async function selectVod(vodId, dayKey) {
   renderChips();
   renderGrid();
   renderJobs();
+  const review = $("btn-review");
+  if (review) {
+    const day = state.dayKey && state.dayKey !== "local" ? state.dayKey : null;
+    review.href = day
+      ? `/review/${encodeURIComponent(day)}/${encodeURIComponent(state.vodId)}`
+      : `/review/${encodeURIComponent(state.vodId)}`;
+    review.classList.remove("hidden");
+  }
   const first = videosOfKind(state.kind)[0];
   if (first) play(first);
 }

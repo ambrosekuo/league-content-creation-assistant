@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Royalty-free lofi / chill beds from Mixkit (YouTube-safe, no attribution).
 
+Montage / high-energy tracks live in assets/music/pool.json (see music_pool.py).
+
   python fetch_music.py                 # status
   python fetch_music.py --suggest       # download catalog → assets/music/suggested/
   python fetch_music.py --preview       # play ~12s of each track
@@ -105,6 +107,7 @@ def status() -> None:
             f"({track['genre']}, {track['duration']})  {share:.0%}  [{mark}]"
         )
     print("\nPreview:  python fetch_music.py --preview")
+    print("Pool:     python music_pool.py")
     print("Mix:      python fetch_music.py --mix VIDEO.mp4 --track auto")
 
 

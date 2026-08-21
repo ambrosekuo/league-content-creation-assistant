@@ -24,7 +24,7 @@ gcloud run jobs deploy vod-portrait-process \
   --max-retries=0 \
   --set-env-vars="GCS_BUCKET=${GCS_BUCKET},GCS_PREFIX=vods,TWITCH_CHANNEL=lolambrosek,RIOT_REGION=americas,WORK_DIR=/tmp/vod-work,GCS_DAY_TZ=America/New_York" \
   --command=python \
-  --args="cloud_job.py,process-portraits,--vod-id,${VOD_ID},--cleanup,--clean-work,--force,--preset,veryfast,--crf,20,--track-champion"
+  --args="cloud_job.py,process-portraits,--vod-id,${VOD_ID},--cleanup,--clean-work,--force,--preset,veryfast,--crf,20,--track-champion,--game-zoom,0.65,--cam-hole,fill"
 
 # Workflow SA needs permission to run both jobs
 PROJECT_NUMBER="$(gcloud projects describe "$PROJECT_ID" --format='value(projectNumber)')"

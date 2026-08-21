@@ -11,6 +11,8 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from dataset_paths import vod_id_from_dir_name
+
 
 class GCSNotConfiguredError(RuntimeError):
     pass
@@ -30,6 +32,11 @@ _MONTHS = (
     "nov",
     "dec",
 )
+
+
+def vod_id_from_dataset(vod_id: str | None, dataset_dir: Path | None) -> str:
+    raw = (vod_id or (dataset_dir.name if dataset_dir else "")).strip()
+    return vod_id_from_dir_name(raw).lstrip("v")
 
 
 def bucket_name() -> str:
@@ -708,8 +715,10 @@ def restore_clips_prefix(
 
 def restore_cut_run_progress(vod_id: str, dataset_dir: Path) -> str | None:
     """
-    If GCS has an incomplete .cut_run.json, restore it + any already-published clips
-    so a cancelled Cloud Run job can resume without redoing finished mp4s.
+    If GCS has an incomplete .cut_run.json, restore the marker (+ partial manifest).
+
+    Does not re-download clip mp4s — incremental publish keeps them on GCS and
+    cut_lol_clips --resume skips via blob_exists after upload deletes locals.
     """
     vid = vod_id.strip().lstrip("v")
     dataset_dir.mkdir(parents=True, exist_ok=True)
@@ -729,25 +738,88 @@ def restore_cut_run_progress(vod_id: str, dataset_dir: Path) -> str | None:
     subdir = str(data.get("clips_subdir") or "").strip()
     if not subdir:
         return None
-    remote_clips = f"{base}/{subdir}/"
     local_clips = dataset_dir / subdir
-    files = download_prefix(remote_clips, local_clips)
+    local_clips.mkdir(parents=True, exist_ok=True)
+    remote_manifest = f"{base}/{subdir}/clips.json"
+    local_manifest = local_clips / "clips.json"
+    if blob_exists(remote_manifest) and not local_manifest.is_file():
+        download_file(remote_manifest, local_manifest)
     print(
-        f"[resume] restored {len(files)} object(s) under {subdir}/ from GCS",
+        f"[resume] marker {subdir}/ (clips stay on GCS; cut --resume checks blob_exists)",
         flush=True,
     )
     return subdir
 
 
-def restore_compilations_prefix(vod_id: str, dataset_dir: Path) -> Path:
-    """Download lol_compilations/ for portrait post-processing. No source.mp4."""
+def restore_compilations_prefix(
+    vod_id: str,
+    dataset_dir: Path,
+    *,
+    name_contains: str | None = None,
+) -> Path:
+    """Download lol_compilations/ for portrait post-processing. No source.mp4.
+
+    If ``name_contains`` is set, only download weave mp4s (and their lobby
+    png/meta sidecars) whose filename contains that substring — skips the
+    rest of the VOD's weaves.
+    """
     vid = vod_id.strip().lstrip("v")
     dataset_dir.mkdir(parents=True, exist_ok=True)
     day = resolve_day_key(vid, dataset_dir)
     base = vod_prefix(vid, day_key=day)
     remote = f"{base}/lol_compilations/"
     local = dataset_dir / "lol_compilations"
-    files = download_prefix(remote, local)
+    needle = (name_contains or "").strip().lower()
+    if needle:
+        client = _client()
+        bucket = client.bucket(bucket_name())
+        local.mkdir(parents=True, exist_ok=True)
+        files: list[Path] = []
+        matched_stems: set[str] = set()
+        for blob in client.list_blobs(bucket, prefix=remote):
+            name = blob.name
+            if name.endswith("/"):
+                continue
+            rel = name[len(remote) :].lstrip("/")
+            if not rel or "/" in rel:
+                continue
+            lower = rel.lower()
+            if not lower.endswith(".mp4"):
+                continue
+            if "lobby" in lower or lower.endswith("_portrait.mp4"):
+                continue
+            if needle not in lower:
+                continue
+            matched_stems.add(Path(rel).stem)
+        if not matched_stems:
+            raise FileNotFoundError(
+                f"No weaves matching {needle!r} under gs://{bucket_name()}/{remote}"
+            )
+        want = set()
+        for stem in matched_stems:
+            want.add(f"{stem}.mp4")
+            want.add(f"{stem}_lobby.png")
+            want.add(f"{stem}_lobby_meta.json")
+        want.add("compilations.json")
+        for blob in client.list_blobs(bucket, prefix=remote):
+            name = blob.name
+            if name.endswith("/"):
+                continue
+            rel = name[len(remote) :].lstrip("/")
+            if rel not in want:
+                continue
+            dest = local / rel
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            print(f"[download] gs://{bucket_name()}/{name} → {dest}", flush=True)
+            blob.download_to_filename(str(dest))
+            files.append(dest)
+        print(
+            f"[restore] --only {needle!r}: {len(matched_stems)} weave(s), "
+            f"{len(files)} object(s)",
+            flush=True,
+        )
+    else:
+        files = download_prefix(remote, local)
     if not files:
         raise FileNotFoundError(f"No compilations under gs://{bucket_name()}/{remote}")
     for name in ("metadata.json", "archive_manifest.json", "compilations.json"):
@@ -763,6 +835,34 @@ def restore_compilations_prefix(vod_id: str, dataset_dir: Path) -> Path:
     return local
 
 
+def restore_portraits_prefix(
+    vod_id: str,
+    dataset_dir: Path,
+    *,
+    name_contains: str | None = None,
+) -> Path:
+    """Download lol_compilations_portrait/ for decorate. No source.mp4."""
+    vid = vod_id.strip().lstrip("v")
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+    day = resolve_day_key(vid, dataset_dir)
+    base = vod_prefix(vid, day_key=day)
+    remote = f"{base}/lol_compilations_portrait/"
+    local = dataset_dir / "lol_compilations_portrait"
+    needle = (name_contains or "").strip().lower()
+    files = download_prefix(remote, local)
+    if needle and not any(
+        p.suffix.lower() == ".mp4" and needle in p.name.lower() for p in files
+    ):
+        raise FileNotFoundError(
+            f"No portraits matching {needle!r} under gs://{bucket_name()}/{remote}"
+        )
+    if needle:
+        print(f"[restore] portraits --only {needle!r}: {len(files)} object(s)", flush=True)
+    if not files:
+        raise FileNotFoundError(f"No portraits under gs://{bucket_name()}/{remote}")
+    return local
+
+
 def upload_portrait_artifacts(
     dataset_dir: Path,
     *,
@@ -771,7 +871,7 @@ def upload_portrait_artifacts(
 ) -> dict[str, str]:
     """Upload lol_compilations_portrait/ only."""
     dataset_dir = dataset_dir.resolve()
-    vid = (vod_id or dataset_dir.name).strip().lstrip("v")
+    vid = vod_id_from_dataset(vod_id, dataset_dir)
     day = resolve_day_key(vid, dataset_dir)
     base = vod_prefix(vid, day_key=day)
     uploaded: dict[str, str] = {}
@@ -802,7 +902,7 @@ def upload_portrait_paths(
 ) -> dict[str, str]:
     """Upload specific portrait files (no remote clear). For incremental publish."""
     dataset_dir = dataset_dir.resolve()
-    vid = (vod_id or dataset_dir.name).strip().lstrip("v")
+    vid = vod_id_from_dataset(vod_id, dataset_dir)
     day = day_key or resolve_day_key(vid, dataset_dir)
     base = vod_prefix(vid, day_key=day)
     uploaded: dict[str, str] = {}
@@ -830,7 +930,7 @@ def upload_portrait_paths(
 def upload_compilation_artifacts(dataset_dir: Path, *, vod_id: str | None = None) -> dict[str, str]:
     """Upload lol_compilations/ only (does not touch lol_clips/ or source)."""
     dataset_dir = dataset_dir.resolve()
-    vid = (vod_id or dataset_dir.name).strip().lstrip("v")
+    vid = vod_id_from_dataset(vod_id, dataset_dir)
     day = resolve_day_key(vid, dataset_dir)
     base = vod_prefix(vid, day_key=day)
     uploaded: dict[str, str] = {}
@@ -871,7 +971,7 @@ def upload_clip_artifacts(
     set replace_clips_prefix=False (clips already published one-by-one).
     """
     dataset_dir = dataset_dir.resolve()
-    vid = (vod_id or dataset_dir.name).strip().lstrip("v")
+    vid = vod_id_from_dataset(vod_id, dataset_dir)
     day = resolve_day_key(vid, dataset_dir)
     base = vod_prefix(vid, day_key=day)
     uploaded: dict[str, str] = {}
@@ -917,7 +1017,7 @@ def upload_dataset_dir(dataset_dir: Path, *, vod_id: str | None = None) -> dict[
     if not dataset_dir.is_dir():
         raise FileNotFoundError(dataset_dir)
 
-    vid = (vod_id or dataset_dir.name).strip().lstrip("v")
+    vid = vod_id_from_dataset(vod_id, dataset_dir)
     day = resolve_day_key(vid, dataset_dir)
     base = vod_prefix(vid, day_key=day)
     uploaded: dict[str, str] = {}
@@ -992,6 +1092,7 @@ REQUIRED_RENDER_ASSETS = (
     "stings/suggested/loss_253886_negative_beeps_wav.wav",
     "stings/suggested/sparkle_511485_cartoon_wink_magic_sparkle_wav.wav",
     "music/catalog.json",
+    "music/pool.json",
 )
 
 

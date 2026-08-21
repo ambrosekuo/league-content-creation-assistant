@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any
 
 from score_windows import exclamation_bonus
+from dataset_paths import find_dataset_dir
 
 FOLDER_RE = re.compile(
     r"^g(?P<game>\d+)_(?P<champ>[A-Za-z0-9]+)(?:_vs(?P<lane>[A-Za-z0-9]+))?$",
@@ -55,7 +56,8 @@ LANE_OTHER = 0.4
 EXTRA_KILL = 1.4  # second+ KILL label in the window
 ASSIST_ONLY = -1.8
 ASSIST_ONLY_LANE = -0.6
-FIRST_KILL = 0.4
+FIRST_KILL = 1.6
+FIRST_LANE_SOLO = 2.2  # extra when the opener is a survived 1v1 vs lane
 IDEAL_DUR = (8.0, 16.0)
 SOFT_DUR = (6.0, 22.0)
 VOICE_CAP = 1.0
@@ -233,7 +235,12 @@ def voice_score(
     return total, tags, text
 
 
-def score_clip(clip: dict[str, Any], *, first_kill: bool) -> dict[str, Any]:
+def score_clip(
+    clip: dict[str, Any],
+    *,
+    first_kill: bool,
+    first_lane_solo: bool = False,
+) -> dict[str, Any]:
     types = [norm_type(t) for t in (clip.get("types") or [])]
     types = [t for t in types if t]
     has_end = "GAME_END" in types
@@ -260,7 +267,14 @@ def score_clip(clip: dict[str, Any], *, first_kill: bool) -> dict[str, Any]:
     if types and set(highlight_types) <= {"ASSIST"}:
         assist_pen = ASSIST_ONLY_LANE if vs_lane else ASSIST_ONLY
 
-    opener = FIRST_KILL if first_kill and "KILL" in types and not died else 0.0
+    opener = 0.0
+    if first_kill and "KILL" in types:
+        opener += FIRST_KILL
+        # First blood still counts if you traded; don't let DEATH bury it.
+        if died:
+            type_pts -= TYPE_WEIGHTS.get("DEATH", 0.0)
+    if first_lane_solo:
+        opener += FIRST_LANE_SOLO
     dur = duration_score(float(clip.get("duration") or 0.0), has_end=has_end)
     voice = float((clip.get("voice") or {}).get("score") or 0.0)
 
@@ -298,7 +312,9 @@ def score_clip(clip: dict[str, Any], *, first_kill: bool) -> dict[str, Any]:
         why.append("game end")
     if assist_pen < -1:
         why.append("assist only")
-    if opener:
+    if first_lane_solo:
+        why.append("first lane solo")
+    elif first_kill:
         why.append("first kill")
     if dur < -1:
         why.append("long")
@@ -437,13 +453,29 @@ def enrich(clips: list[dict[str, Any]], *, transcript: dict[str, Any] | None) ->
         by_game.setdefault(game_key(clip), []).append(clip)
     for group in by_game.values():
         ordered = sorted(group, key=lambda c: int(c.get("clipIndexInGame") or 10**6))
-        marked = False
+        marked_kill = False
+        marked_solo = False
         for clip in ordered:
-            if not marked and "KILL" in (clip.get("types") or []):
+            types = [norm_type(t) for t in (clip.get("types") or [])]
+            types = [t for t in types if t]
+            died = "DEATH" in types
+            highlight = [t for t in types if t != "GAME_END"]
+            if not marked_kill and "KILL" in types:
                 clip["firstKill"] = True
-                marked = True
+                marked_kill = True
             else:
                 clip["firstKill"] = False
+            lane_solo = (
+                bool(clip.get("vsLane"))
+                and "KILL" in types
+                and not died
+                and set(highlight) <= {"KILL"}
+            )
+            if not marked_solo and lane_solo:
+                clip["firstLaneSolo"] = True
+                marked_solo = True
+            else:
+                clip["firstLaneSolo"] = False
 
 
 def rank_dataset(dataset_dir: Path, clips_dir: Path) -> list[dict[str, Any]]:
@@ -456,7 +488,14 @@ def rank_dataset(dataset_dir: Path, clips_dir: Path) -> list[dict[str, Any]]:
     if tpath.is_file():
         transcript = load_json(tpath)
     enrich(clips, transcript=transcript)
-    scored = [score_clip(c, first_kill=bool(c.get("firstKill"))) for c in clips]
+    scored = [
+        score_clip(
+            c,
+            first_kill=bool(c.get("firstKill")),
+            first_lane_solo=bool(c.get("firstLaneSolo")),
+        )
+        for c in clips
+    ]
     scored.sort(key=lambda c: float(c["score"]), reverse=True)
     for i, clip in enumerate(scored, start=1):
         clip["rank"] = i
@@ -522,17 +561,226 @@ def pick_top_k(
             max_per_matchup=max_per_matchup,
             closer_needs_kill=bool(closer_needs_kill),
         )
+    return _order_picks(picked, order=order)
+
+
+def _opener_clips(group: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """First blood (even a trade) and first survived lane solo, chrono, unique."""
+    seen: set[str] = set()
+    out: list[dict[str, Any]] = []
+    ordered = sorted(group, key=lambda c: int(c.get("clipIndexInGame") or 10**6))
+    for clip in ordered:
+        if not (clip.get("firstKill") or clip.get("firstLaneSolo")):
+            continue
+        rel = str(clip.get("relativePath") or "")
+        if not rel or rel in seen:
+            continue
+        seen.add(rel)
+        out.append(clip)
+    return out
+
+
+def _chrono_key(clip: dict[str, Any]) -> tuple[Any, ...]:
+    return (
+        str(clip.get("vodId") or ""),
+        int(clip.get("gameIndex") or 0),
+        int(clip.get("clipIndexInGame") or 0),
+    )
+
+
+def _order_picks(picked: list[dict[str, Any]], *, order: str) -> list[dict[str, Any]]:
+    out = list(picked)
     if str(order).strip().lower() == "score":
-        picked.sort(key=lambda c: float(c.get("score") or 0.0), reverse=True)
+        out.sort(key=lambda c: float(c.get("score") or 0.0), reverse=True)
     else:
-        picked.sort(
-            key=lambda c: (
-                str(c.get("vodId") or ""),
-                int(c.get("gameIndex") or 0),
-                int(c.get("clipIndexInGame") or 0),
-            )
-        )
+        out.sort(key=_chrono_key)
+    return out
+
+
+def _iter_game_groups(ranked: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    by_game: dict[str, list[dict[str, Any]]] = {}
+    for clip in ranked:
+        by_game.setdefault(game_key(clip), []).append(clip)
+    return list(by_game.values())
+
+
+def _select_top_score(
+    group: list[dict[str, Any]],
+    k: int,
+    *,
+    max_death_per_game: int = 2,
+) -> list[dict[str, Any]]:
+    """Top K by content score. GAME_END competes; no reserved closer slot."""
+    ranked = sorted(group, key=lambda c: float(c.get("score") or 0.0), reverse=True)
+    picked: list[dict[str, Any]] = []
+    deaths = 0
+    seen: set[str] = set()
+
+    def take(clip: dict[str, Any], *, ignore_death_cap: bool = False) -> bool:
+        nonlocal deaths
+        if k > 0 and len(picked) >= k:
+            return False
+        rel = str(clip.get("relativePath") or "")
+        if not rel or rel in seen:
+            return False
+        types = clip.get("types") or []
+        if (
+            not ignore_death_cap
+            and "DEATH" in types
+            and max_death_per_game > 0
+            and deaths >= max_death_per_game
+        ):
+            return False
+        picked.append(clip)
+        seen.add(rel)
+        if "DEATH" in types:
+            deaths += 1
+        return True
+
+    for clip in _opener_clips(group):
+        take(clip, ignore_death_cap=True)
+    for clip in ranked:
+        take(clip)
     return picked
+
+
+def pick_top_score(
+    ranked: list[dict[str, Any]],
+    k: int,
+    *,
+    per_game: bool = True,
+    order: str = "chrono",
+    max_death_per_game: int = 2,
+) -> list[dict[str, Any]]:
+    if k <= 0:
+        picked = list(ranked)
+    elif per_game:
+        picked = []
+        for group in _iter_game_groups(ranked):
+            picked.extend(
+                _select_top_score(group, k, max_death_per_game=max_death_per_game)
+            )
+    else:
+        picked = _select_top_score(ranked, k, max_death_per_game=max_death_per_game)
+    return _order_picks(picked, order=order)
+
+
+def _select_duration_budget(
+    group: list[dict[str, Any]],
+    *,
+    min_score: float,
+    max_duration: float,
+    min_clips: int = 2,
+    max_same_opp: int = 3,
+) -> list[dict[str, Any]]:
+    """Keep clips above a score floor until a duration budget is full."""
+    ranked = sorted(group, key=lambda c: float(c.get("score") or 0.0), reverse=True)
+    picked: list[dict[str, Any]] = []
+    used = 0.0
+    seen: set[str] = set()
+    opp_n: dict[str, int] = {}
+
+    def try_take(clip: dict[str, Any], *, ignore_floor: bool) -> bool:
+        nonlocal used
+        rel = str(clip.get("relativePath") or "")
+        if not rel or rel in seen:
+            return False
+        score = float(clip.get("score") or 0.0)
+        if not ignore_floor and score < min_score:
+            return False
+        dur = max(0.0, float(clip.get("duration") or 0.0))
+        if picked and max_duration > 0 and used + dur > max_duration:
+            return False
+        opp = str(
+            clip.get("opponentChampion") or clip.get("laneOpponentChampion") or ""
+        ).lower()
+        if opp and opp_n.get(opp, 0) >= max_same_opp and score < 5.5:
+            if not clip.get("firstKill"):
+                return False
+        picked.append(clip)
+        seen.add(rel)
+        used += dur
+        if opp:
+            opp_n[opp] = opp_n.get(opp, 0) + 1
+        return True
+
+    for clip in _opener_clips(group):
+        try_take(clip, ignore_floor=True)
+    for clip in ranked:
+        try_take(clip, ignore_floor=False)
+    if len(picked) < min_clips:
+        for clip in ranked:
+            if len(picked) >= min_clips:
+                break
+            try_take(clip, ignore_floor=True)
+    return picked
+
+
+def pick_duration_budget(
+    ranked: list[dict[str, Any]],
+    *,
+    per_game: bool = True,
+    min_score: float = 3.5,
+    max_duration: float = 150.0,
+    min_clips: int = 2,
+    order: str = "chrono",
+) -> list[dict[str, Any]]:
+    if per_game:
+        picked: list[dict[str, Any]] = []
+        for group in _iter_game_groups(ranked):
+            picked.extend(
+                _select_duration_budget(
+                    group,
+                    min_score=min_score,
+                    max_duration=max_duration,
+                    min_clips=min_clips,
+                )
+            )
+    else:
+        picked = _select_duration_budget(
+            ranked,
+            min_score=min_score,
+            max_duration=max_duration,
+            min_clips=min_clips,
+        )
+    return _order_picks(picked, order=order)
+
+
+SELECTORS = ("current", "competitive", "top8", "duration")
+
+
+def pick_by_selector(
+    ranked: list[dict[str, Any]],
+    selector: str,
+    *,
+    per_game: bool = True,
+    order: str = "chrono",
+    top_k: int | None = None,
+    min_score: float = 3.5,
+    max_duration: float = 150.0,
+) -> list[dict[str, Any]]:
+    """Named recap selectors for A/B tests. GAME_END is not special except in current."""
+    name = str(selector or "current").strip().lower()
+    if name in {"current", "reserved", "reserved_closer"}:
+        k = 5 if top_k is None else int(top_k)
+        return pick_top_k(ranked, k, per_game=per_game, order=order, max_closers=1)
+    if name in {"competitive", "no_reserved_closer", "top_score"}:
+        k = 5 if top_k is None else int(top_k)
+        return pick_top_score(ranked, k, per_game=per_game, order=order)
+    if name in {"top8", "top_8"}:
+        k = 8 if top_k is None else int(top_k)
+        return pick_top_score(ranked, k, per_game=per_game, order=order)
+    if name in {"duration", "budget", "score_floor"}:
+        return pick_duration_budget(
+            ranked,
+            per_game=per_game,
+            min_score=min_score,
+            max_duration=max_duration,
+            order=order,
+        )
+    raise ValueError(
+        f"unknown selector {selector!r} (expected {', '.join(SELECTORS)})"
+    )
 
 
 def _select_slate(
@@ -564,7 +812,7 @@ def _select_slate(
             return False
         types = clip.get("types") or []
         if "DEATH" in types and max_death_per_game > 0:
-            if game_deaths.get(gk, 0) >= max_death_per_game:
+            if game_deaths.get(gk, 0) >= max_death_per_game and not clip.get("firstKill"):
                 return False
         if as_closer:
             if max_closers <= 0 or n_closers >= max_closers:
@@ -601,6 +849,13 @@ def _select_slate(
     highlight_budget = k
     if max_closers > 0 and closers:
         highlight_budget = max(0, k - 1)
+
+    for clip in _opener_clips(ranked):
+        if len(picked) >= highlight_budget:
+            break
+        if "GAME_END" in (clip.get("types") or []):
+            continue
+        take(clip, as_closer=False)
 
     for clip in ranked:
         if len(picked) >= highlight_budget:
@@ -652,6 +907,8 @@ def write_rank_outputs(
             "laneKill": LANE_KILL,
             "laneTrade": LANE_TRADE,
             "assistOnly": ASSIST_ONLY,
+            "firstKill": FIRST_KILL,
+            "firstLaneSolo": FIRST_LANE_SOLO,
             "voiceCap": VOICE_CAP,
         },
         "clip_count": len(scored),
@@ -840,7 +1097,8 @@ def main() -> int:
     if args.dataset_dir is not None:
         dataset_dir = args.dataset_dir.resolve()
     elif args.dataset_id:
-        dataset_dir = (args.output_root / args.dataset_id).resolve()
+        found = find_dataset_dir(args.output_root, args.dataset_id)
+        dataset_dir = (found or args.output_root / args.dataset_id).resolve()
     else:
         print("Provide --dataset-id or --dataset-dir.", file=sys.stderr)
         return 2

@@ -19,6 +19,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from ffmpeg_color import IMAGE_TO_BT709, X264_BT709
 from generate_lobby_card import (
     ROLE_ORDER,
     loading_splash,
@@ -633,10 +634,11 @@ def write_story_mp4(
             str(rate),
             "-i",
             str(tmp_dir / "f%04d.jpg"),
+            "-vf",
+            IMAGE_TO_BT709,
             "-c:v",
             "libx264",
-            "-pix_fmt",
-            "yuv420p",
+            *X264_BT709,
             "-crf",
             "18",
             "-preset",

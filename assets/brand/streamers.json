@@ -11,6 +11,18 @@
       "display": "AidenYasuo",
       "names": ["aiden yasuo", "ankara aiden"],
       "tags": ["messi"]
+    },
+    {
+      "id": "laceration",
+      "display": "Laceration",
+      "names": ["laceration"],
+      "tags": ["zed"]
+    },
+    {
+      "id": "allyoops",
+      "display": "Allyoops",
+      "names": ["allyoops", "pimp daddy1233", "pimpdaddy1233"],
+      "tags": ["ilysm"]
     }
   ]
 }
